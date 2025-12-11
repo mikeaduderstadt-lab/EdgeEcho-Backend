@@ -1,87 +1,99 @@
-from fastapi import FastAPI, HTTPException, Header
+# main.py
+
+import os
+import uvicorn
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
-import os
-import time
+from dotenv import load_dotenv
 
-app = FastAPI(title="EdgeEcho API") 
+# 1. Load Environment Variables
+# This loads GROQ_API_KEY and APP_SECRET from the .env file (locally)
+# Railway will use the environment variables set in the dashboard instead.
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# --- 1. CORS Setup ---
+# 2. Initialize FastAPI App
+app = FastAPI(
+    title="Interview Whisperer Backend API",
+    description="Real-time AI Interview Feedback powered by Groq",
+    version="1.0.0",
+)
+
+# 3. Configure CORS (Critical for allowing your local client script to connect)
+# In production, you would restrict this to your specific client origin.
+origins = [
+    "*", # Allow all origins for initial testing (replace with specific domain later)
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 2. Groq Initialization ---
-# Railway will automatically load the GROQ_API_KEY from the Variables tab.
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") 
+# 4. Initialize Groq Client
+if not GROQ_API_KEY:
+    # If key is missing, crash immediately with an error that is visible in logs
+    raise ValueError("GROQ_API_KEY environment variable is not set.")
+
+# This is the line that required the dependency update, now fixed!
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# This secret key protects your endpoint (Make sure this matches your client code!)
-APP_SECRET = "your-secret-key-2024" 
 
-# --- 3. Data Models ---
-class QuestionRequest(BaseModel):
-    question: str
-    user_id: str = "beta"
-    
-class AnswerResponse(BaseModel):
-    answer: str
-    model: str
-    processing_time: float
-    source: str = "Groq"
+# --- API Endpoints ---
 
-# --- 4. Main AI Endpoint: /api/answer ---
-@app.post("/api/answer", response_model=AnswerResponse)
-async def get_answer(
-    request: QuestionRequest,
-    x_api_key: str = Header(None)
-):
-    # Security check: Ensure the local client has the correct secret
-    if x_api_key != APP_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid API key")
+# 5. Health Check Endpoint (The fix for the 404 error)
+@app.get("/health")
+def health_check():
+    """Returns a simple status to confirm the API is running."""
+    return {"status": "ok", "message": "API is online and ready for production"}
+
+
+# Data model for the incoming request from the local client script
+class WhisperRequest(BaseModel):
+    transcript_chunk: str
+
+# 6. Main Logic Endpoint (Placeholder for your Groq logic)
+@app.post("/api/whisper")
+async def process_transcript(data: WhisperRequest):
+    """
+    Receives a chunk of transcribed text and sends it to Groq for analysis.
+    """
+    if not data.transcript_chunk:
+        raise HTTPException(status_code=400, detail="Transcript chunk is empty")
     
+    # --- Groq Integration Logic Goes Here ---
+    
+    # Example: Send the chunk to Groq for analysis
+    # This is placeholder logic; the actual implementation might involve streaming or state management.
     try:
-        start_time = time.time()
-        
-        # Call Groq with ELITE speed settings (llama3-70b-8192 is the fastest elite model)
-        response = groq_client.chat.completions.create(
-            model="llama3-70b-8192", 
+        chat_completion = groq_client.chat.completions.create(
             messages=[
                 {
                     "role": "system",
-                    "content": """You are an elite interview coach for high-stakes candidates (McKinsey, Google, etc.).
-                    
-Provide a concise, strategic answer in 1-2 sentences. Be confident and direct.
-Focus on frameworks, key insights, or memory triggers - NOT full speeches.
-The candidate needs to remember this quickly under pressure."""
+                    "content": "You are a real-time interview coach. Analyze the user's latest spoken sentence for clarity and content. Keep your response very short, no more than 10 words.",
                 },
                 {
                     "role": "user",
-                    "content": f"Interview question: {request.question}"
+                    "content": data.transcript_chunk,
                 }
             ],
-            temperature=0.6,
-            max_tokens=100, 
-            top_p=0.9
+            model="mixtral-8x7b-32768", # Fast model choice
         )
         
-        processing_time = time.time() - start_time
-        answer_text = response.choices[0].message.content
+        feedback = chat_completion.choices[0].message.content
         
-        return AnswerResponse(
-            answer=answer_text,
-            model="groq-llama3-70b",
-            processing_time=round(processing_time, 3)
-        )
-        
+        return {"feedback": feedback, "chunk_received": data.transcript_chunk}
+
     except Exception as e:
-        print(f"Error processing question: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI processing failed: {str(e)}"
-        )
+        print(f"Groq API Error: {e}")
+        # Return a 500 error but keep the server running
+        raise HTTPException(status_code=500, detail="Internal Groq API Error")
+
+# Optional: Run the app locally for testing (only runs if executed directly)
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
