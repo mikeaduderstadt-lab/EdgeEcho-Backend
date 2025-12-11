@@ -136,8 +136,8 @@ Be confident and direct."""
                     "content": f"Interview question: {request.question}"
                 }
             ],
-            # 💥 THE MODEL NAME FIX IS HERE 💥
-            model="llama-3.1-70b-versatile",  # Current Groq model
+            # 💥 THE FINAL MODEL NAME FIX IS HERE 💥
+            model="mixtral-8x7b-32768",  # Recommended high-performance replacement
             temperature=0.6,
             max_tokens=max_tokens,
             top_p=0.9
@@ -153,7 +153,7 @@ Be confident and direct."""
         # Return response
         return AnswerResponse(
             answer=answer_text,
-            model="groq-llama-3.1-70b",
+            model="groq-mixtral-8x7b",
             processing_time=round(processing_time, 3),
             timestamp=time.time()
         )
