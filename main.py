@@ -136,8 +136,8 @@ Be confident and direct."""
                     "content": f"Interview question: {request.question}"
                 }
             ],
-            # 💥 THE FINAL MODEL NAME FIX IS HERE 💥
-            model="mixtral-8x7b-32768",  # Recommended high-performance replacement
+            # 💥 THE FINAL, STABLE MODEL FIX IS HERE 💥
+            model="llama-3.1-8b-instant",  # The currently stable and fast model
             temperature=0.6,
             max_tokens=max_tokens,
             top_p=0.9
@@ -153,7 +153,7 @@ Be confident and direct."""
         # Return response
         return AnswerResponse(
             answer=answer_text,
-            model="groq-mixtral-8x7b",
+            model="groq-llama-3.1-8b",
             processing_time=round(processing_time, 3),
             timestamp=time.time()
         )
