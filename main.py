@@ -136,7 +136,8 @@ Be confident and direct."""
                     "content": f"Interview question: {request.question}"
                 }
             ],
-            model="llama3-70b-8192",  # Fast and intelligent
+            # 💥 THE MODEL NAME FIX IS HERE 💥
+            model="llama-3.1-70b-versatile",  # Current Groq model
             temperature=0.6,
             max_tokens=max_tokens,
             top_p=0.9
@@ -152,7 +153,7 @@ Be confident and direct."""
         # Return response
         return AnswerResponse(
             answer=answer_text,
-            model="groq-llama3-70b",
+            model="groq-llama-3.1-70b",
             processing_time=round(processing_time, 3),
             timestamp=time.time()
         )
