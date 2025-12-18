@@ -5,10 +5,8 @@ import time
 import requests
 
 app = Flask(__name__)
-# This line unlocks the 'door' so your Vercel UI can talk to Railway
 CORS(app) 
 
-# Pulls your key from the Railway 'Variables' tab we synced
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 @app.route('/process', methods=['POST'])
@@ -51,6 +49,5 @@ def get_answer():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    # Railway provides the PORT dynamically
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
