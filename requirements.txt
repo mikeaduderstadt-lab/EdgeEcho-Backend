@@ -1,5 +1,3 @@
-fastapi
-uvicorn[standard]
-groq
-python-dotenv
-pydantic
+flask
+flask-cors
+requests
