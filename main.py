@@ -1,10 +1,8 @@
 import os
-import uuid
+import tempfile
 import time
-from typing import Optional
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -19,7 +17,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# Safe Groq client initialization
+client = None
+try:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        print("WARNING: GROQ_API_KEY not set")
+    else:
+        client = Groq(api_key=api_key)
+        print("✅ Groq client initialized successfully")
+except Exception as e:
+    print(f"❌ ERROR creating Groq client: {e}")
+    client = None
+
 usage_tracker = {}
 
 @app.get("/")
@@ -28,29 +38,35 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "groq_configured": True}
+    return {
+        "status": "ok", 
+        "groq_configured": client is not None,
+        "api_key_present": bool(os.getenv("GROQ_API_KEY"))
+    }
 
 @app.get("/founder_spots")
 async def get_founder_spots():
-    # Fixes 404 in frontend
     import random
     return {"remaining": random.randint(12, 47)}
 
 @app.post("/process_audio")
 async def process_audio(
-    audio: UploadFile = File(None),     # Primary field name
-    file: UploadFile = File(None),      # Backup for browser inconsistencies
+    audio: UploadFile = File(None),
+    file: UploadFile = File(None),
     deviceId: str = Form(...),
     userEmail: str = Form("anonymous"),
     context: str = Form("a professional role"),
     work_history: str = Form(""),
     style: str = Form("script")
 ):
-    """
-    Defensive audio processing with dual file field support
-    """
+    # Check if Groq is available
+    if client is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="AI service unavailable - check server configuration"
+        )
     
-    # GEMINI'S SMART PART: Accept either field name
+    # Get the actual file
     actual_file = audio or file
     if not actual_file:
         raise HTTPException(status_code=400, detail="No audio file provided")
@@ -72,23 +88,24 @@ async def process_audio(
     try:
         start_time = time.time()
         
-        # GEMINI'S STABLE FILE HANDLING
+        # Read audio content
         content = await actual_file.read()
-        temp_filename = f"{uuid.uuid4()}.webm"
         
-        with open(temp_filename, "wb") as f:
-            f.write(content)
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
+            temp_file.write(content)
+            temp_filename = temp_file.name
         
-        # Transcribe
-        with open(temp_filename, "rb") as f:
+        # Transcribe using Groq
+        with open(temp_filename, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
-                file=(temp_filename, f.read()),
+                file=(actual_file.filename or "audio.webm", audio_file.read()),
                 model="whisper-large-v3-turbo",
                 response_format="text",
             )
         
-        # Cleanup immediately after use
-        os.remove(temp_filename)
+        # Clean up temp file
+        os.unlink(temp_filename)
         
         transcript = transcription.strip() if transcription else ""
         
@@ -100,34 +117,25 @@ async def process_audio(
                 "processing_time": round(time.time() - start_time, 3)
             }
         
-        # YOUR STRUCTURED STYLE HANDLING (better than Gemini's)
+        # Generate answer based on style
         if style == "shorthand":
             system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-
 Their background: {work_history}
-
 Provide ONE hint or framework name only. Max 10 words."""
             max_tokens = 50
-            
         elif style == "bullet":
             system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-
 Their background: {work_history}
-
 Provide 3 tactical bullet points. Max 100 words total."""
             max_tokens = 200
-            
-        else:  # script (default)
+        else:
             system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-
 Their background: {work_history}
-
 Provide a 2-3 sentence tactical answer. Be concise and confident."""
             max_tokens = 150
         
-        # Generate answer - START WITH FAST MODEL (you can upgrade later if needed)
         completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",  # Fast for real-time; upgrade to 70b if latency is OK
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Interview question: {transcript}"}
@@ -138,12 +146,10 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
         )
         
         answer = completion.choices[0].message.content.strip()
-        
-        # Update usage
         usage_tracker[user_key] = current_used + 1
         processing_time = time.time() - start_time
         
-        print(f"[{time.time()}] Device: {deviceId} | Email: {userEmail} | Q: {transcript[:50]}... | Time: {processing_time:.3f}s")
+        print(f"[AUDIO PROCESSED] Device: {deviceId} | Q: {transcript[:50]}... | Time: {processing_time:.3f}s")
         
         return {
             "transcript": transcript,
@@ -153,15 +159,15 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
         }
         
     except Exception as e:
-        print(f"ERROR in /process_audio: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 @app.post("/save_email")
 async def save_email(data: dict):
     device_id = data.get("deviceId")
     email = data.get("email")
-    
-    # Migrate usage from anonymous to email key
     old_key = f"{device_id}_anonymous"
     new_key = f"{device_id}_{email}"
     
@@ -169,7 +175,7 @@ async def save_email(data: dict):
         usage_tracker[new_key] = usage_tracker[old_key]
         del usage_tracker[old_key]
     
-    print(f"Email saved: {email} for device {device_id}")
+    print(f"Email saved: {email}")
     return {"status": "success", "message": "Trial extended to 10 questions"}
 
 if __name__ == "__main__":
