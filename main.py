@@ -1,14 +1,19 @@
 import os
 import tempfile
 import time
+import logging
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from dotenv import load_dotenv
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
-app = FastAPI(title="CerebroEcho API", version="1.1.0")
+app = FastAPI(title="CerebroEcho API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,19 +27,19 @@ client = None
 try:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        print("WARNING: GROQ_API_KEY not set")
+        logger.warning("⚠️ GROQ_API_KEY not set")
     else:
         client = Groq(api_key=api_key)
-        print("✅ Groq client initialized successfully")
+        logger.info("✅ Groq client initialized successfully")
 except Exception as e:
-    print(f"❌ ERROR creating Groq client: {e}")
+    logger.error(f"❌ ERROR creating Groq client: {e}")
     client = None
 
 usage_tracker = {}
 
 @app.get("/")
 async def root():
-    return {"status": "CerebroEcho Backend Live", "version": "1.1.0"}
+    return {"status": "CerebroEcho Backend Live", "version": "1.2.0"}
 
 @app.get("/health")
 async def health():
@@ -85,27 +90,43 @@ async def process_audio(
             }
         )
     
+    temp_filename = None
+    
     try:
         start_time = time.time()
         
         # Read audio content
         content = await actual_file.read()
         
-        # Save to temp file
+        # Reject tiny files (likely noise or empty clicks)
+        if len(content) < 1000:
+            logger.warning(f"⚠️ Audio too small: {len(content)} bytes")
+            return {
+                "answer": "Listening...",
+                "transcript": "",
+                "questions_used": current_used,
+                "processing_time": round(time.time() - start_time, 3)
+            }
+        
+        logger.info(f"📝 Transcribing {len(content)} bytes...")
+        
+        # Save to temp file with .webm extension
         with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
             temp_file.write(content)
             temp_filename = temp_file.name
         
-        # Transcribe using Groq
+        # THE FIX: Add "audio/webm" as the 3rd parameter in the tuple
         with open(temp_filename, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
-                file=(actual_file.filename or "audio.webm", audio_file.read()),
+                file=(temp_filename, audio_file.read(), "audio/webm"),  # ✅ MIME type added
                 model="whisper-large-v3-turbo",
                 response_format="text",
             )
         
         # Clean up temp file
-        os.unlink(temp_filename)
+        if temp_filename and os.path.exists(temp_filename):
+            os.unlink(temp_filename)
+            temp_filename = None
         
         transcript = transcription.strip() if transcription else ""
         
@@ -116,6 +137,8 @@ async def process_audio(
                 "questions_used": current_used,
                 "processing_time": round(time.time() - start_time, 3)
             }
+        
+        logger.info(f"✅ Transcript: {transcript[:50]}...")
         
         # Generate answer based on style
         if style == "shorthand":
@@ -149,7 +172,8 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
         usage_tracker[user_key] = current_used + 1
         processing_time = time.time() - start_time
         
-        print(f"[AUDIO PROCESSED] Device: {deviceId} | Q: {transcript[:50]}... | Time: {processing_time:.3f}s")
+        logger.info(f"✅ Answer generated in {processing_time:.2f}s")
+        logger.info(f"[AUDIO PROCESSED] Device: {deviceId} | Q: {transcript[:50]}... | Time: {processing_time:.3f}s")
         
         return {
             "transcript": transcript,
@@ -159,9 +183,14 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
         }
         
     except Exception as e:
-        print(f"ERROR: {str(e)}")
+        logger.error(f"❌ ERROR: {str(e)}")
         import traceback
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
+        
+        # Cleanup on error
+        if temp_filename and os.path.exists(temp_filename):
+            os.unlink(temp_filename)
+        
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 @app.post("/save_email")
@@ -175,7 +204,7 @@ async def save_email(data: dict):
         usage_tracker[new_key] = usage_tracker[old_key]
         del usage_tracker[old_key]
     
-    print(f"Email saved: {email}")
+    logger.info(f"📧 Email saved: {email}")
     return {"status": "success", "message": "Trial extended to 10 questions"}
 
 if __name__ == "__main__":
