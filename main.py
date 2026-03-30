@@ -79,7 +79,7 @@ async def process_audio(
     # Usage tracking
     user_key = f"{deviceId}_{userEmail}"
     current_used = usage_tracker.get(user_key, 0)
-    limit = 10 if userEmail != "anonymous" else 5
+    limit = 999  # TODO: restore to (10 if userEmail != "anonymous" else 5) before launch
     
     if current_used >= limit:
         raise HTTPException(
