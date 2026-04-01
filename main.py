@@ -1,9 +1,11 @@
+import io
 import os
 import tempfile
 import time
 import logging
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -192,6 +194,30 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
             os.unlink(temp_filename)
         
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+@app.post("/tts")
+async def text_to_speech(data: dict):
+    text = data.get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided")
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable")
+    try:
+        response = client.audio.speech.create(
+            model="playai-tts",
+            voice="Fritz-PlayAI",
+            input=text[:500],
+            response_format="wav",
+        )
+        audio_bytes = response.content
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type="audio/wav",
+            headers={"Content-Length": str(len(audio_bytes))},
+        )
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
 
 @app.post("/save_email")
 async def save_email(data: dict):
