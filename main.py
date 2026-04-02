@@ -6,6 +6,7 @@ import logging
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+import openai
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -36,6 +37,8 @@ try:
 except Exception as e:
     logger.error(f"❌ ERROR creating Groq client: {e}")
     client = None
+
+openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 usage_tracker = {}
 
@@ -203,14 +206,12 @@ async def text_to_speech(data: dict):
     if client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable")
     try:
-        response = client.audio.speech.create(
-            model="playai-tts",
-            voice="Fritz-PlayAI",
+        response = openai_client.audio.speech.create(
+            model="tts-1",
+            voice="onyx",
             input=text[:500],
-            response_format="mp3",
         )
-        # Groq SDK returns HttpxBinaryResponseContent; .read() is more reliable than .content
-        audio_bytes = response.read()
+        audio_bytes = response.content
         logger.info(f"TTS generated: {len(audio_bytes)} bytes")
         return StreamingResponse(
             io.BytesIO(audio_bytes),
