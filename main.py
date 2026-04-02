@@ -216,8 +216,10 @@ async def text_to_speech(data: dict):
             headers={"Content-Length": str(len(audio_bytes))},
         )
     except Exception as e:
-        logger.error(f"TTS error: {e}")
-        raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
+        import traceback
+        logger.error(f"TTS error: {type(e).__name__}: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"TTS error: {type(e).__name__}: {str(e)}")
 
 @app.post("/save_email")
 async def save_email(data: dict):
