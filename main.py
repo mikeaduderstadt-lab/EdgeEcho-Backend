@@ -207,12 +207,14 @@ async def text_to_speech(data: dict):
             model="playai-tts",
             voice="Fritz-PlayAI",
             input=text[:500],
-            response_format="wav",
+            response_format="mp3",
         )
-        audio_bytes = response.content
+        # Groq SDK returns HttpxBinaryResponseContent; .read() is more reliable than .content
+        audio_bytes = response.read()
+        logger.info(f"TTS generated: {len(audio_bytes)} bytes")
         return StreamingResponse(
             io.BytesIO(audio_bytes),
-            media_type="audio/wav",
+            media_type="audio/mpeg",
             headers={"Content-Length": str(len(audio_bytes))},
         )
     except Exception as e:
