@@ -222,12 +222,10 @@ async def text_to_speech(data: dict):
             voice=voice,
             input=text[:500],
         )
-        audio_bytes = response.content
-        logger.info(f"TTS generated: {len(audio_bytes)} bytes")
+        logger.info(f"TTS streaming started for: {text[:50]}...")
         return StreamingResponse(
-            io.BytesIO(audio_bytes),
+            response.iter_bytes(),
             media_type="audio/mpeg",
-            headers={"Content-Length": str(len(audio_bytes))},
         )
     except Exception as e:
         import traceback
