@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import logging
+import urllib.parse
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -24,6 +25,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Transcript", "X-Answer", "X-Questions-Used"],
 )
 
 # Safe Groq client initialization
@@ -232,26 +234,140 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
         
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
+@app.post("/process_and_speak")
+async def process_and_speak(
+    audio: UploadFile = File(None),
+    file: UploadFile = File(None),
+    deviceId: str = Form(...),
+    userEmail: str = Form("anonymous"),
+    context: str = Form("a professional role"),
+    work_history: str = Form(""),
+    style: str = Form("script"),
+    voice: str = Form("onyx"),
+):
+    """Unified endpoint: STT + LLM + TTS in one request, streams audio directly."""
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable")
+    if cartesia_client is None:
+        raise HTTPException(status_code=503, detail="TTS service unavailable")
+
+    actual_file = audio or file
+    if not actual_file:
+        raise HTTPException(status_code=400, detail="No audio file provided")
+
+    user_key = f"{deviceId}_{userEmail}"
+    current_used = usage_tracker.get(user_key, 0)
+    limit = 999
+    if current_used >= limit:
+        raise HTTPException(status_code=403, detail={"code": "TRIAL_LIMIT_REACHED", "message": f"Trial limit reached ({limit} questions)"})
+
+    temp_filename = None
+    try:
+        start_time = time.time()
+        content = await actual_file.read()
+
+        if len(content) < 1000:
+            raise HTTPException(status_code=400, detail="Audio too short")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
+            temp_file.write(content)
+            temp_filename = temp_file.name
+
+        with open(temp_filename, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                file=(temp_filename, audio_file.read(), "audio/webm"),
+                model="whisper-large-v3-turbo",
+                response_format="text",
+            )
+
+        if temp_filename and os.path.exists(temp_filename):
+            os.unlink(temp_filename)
+            temp_filename = None
+
+        transcript = transcription.strip() if transcription else ""
+        if not transcript or len(transcript) < 2:
+            raise HTTPException(status_code=400, detail="No speech detected")
+
+        if style == "shorthand":
+            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
+Their background: {work_history}
+Provide ONE hint or framework name only. Max 10 words."""
+            max_tokens = 50
+        elif style == "bullet":
+            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
+Their background: {work_history}
+Provide 3 tactical bullet points. Max 100 words total."""
+            max_tokens = 200
+        else:
+            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
+Their background: {work_history}
+Provide a 2-3 sentence tactical answer. Be concise and confident."""
+            max_tokens = 150
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Interview question: {transcript}"}
+            ],
+            temperature=0.6,
+            max_tokens=max_tokens,
+            top_p=0.9
+        )
+
+        answer = completion.choices[0].message.content.strip()
+        usage_tracker[user_key] = current_used + 1
+        logger.info(f"✅ STT+LLM done in {time.time() - start_time:.2f}s, starting TTS stream")
+
+        voice_id = CARTESIA_VOICE_MAP.get(voice, CARTESIA_VOICE_MAP["onyx"])
+
+        def generate():
+            for chunk in cartesia_client.tts.sse(
+                model_id="sonic-2",
+                transcript=answer[:300],
+                voice={"mode": "id", "id": voice_id},
+                output_format={"container": "mp3", "bit_rate": 128000, "sample_rate": 44100},
+            ):
+                yield chunk.audio
+
+        return StreamingResponse(
+            generate(),
+            media_type="audio/mpeg",
+            headers={
+                "X-Transcript": urllib.parse.quote(transcript[:200]),
+                "X-Answer": urllib.parse.quote(answer[:300]),
+                "X-Questions-Used": str(usage_tracker[user_key]),
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ process_and_speak ERROR: {e}")
+        if temp_filename and os.path.exists(temp_filename):
+            os.unlink(temp_filename)
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+
 @app.post("/tts")
 async def text_to_speech(data: dict):
     text = data.get("text", "").strip()
     voice = data.get("voice", "onyx")
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
-    if cartesia_client is None:
-        raise HTTPException(status_code=503, detail="TTS service unavailable: CARTESIA_API_KEY not set")
+    if openai_client is None:
+        raise HTTPException(status_code=503, detail="TTS service unavailable: OPENAI_API_KEY not set")
     try:
-        voice_id = CARTESIA_VOICE_MAP.get(voice, CARTESIA_VOICE_MAP["onyx"])
-        logger.info(f"TTS streaming started (Cartesia sonic-2, voice={voice}) for: {text[:50]}...")
+        logger.info(f"TTS streaming started (OpenAI tts-1, voice={voice}) for: {text[:50]}...")
 
         def generate():
-            for chunk in cartesia_client.tts.sse(
-                model_id="sonic-2",
-                transcript=text[:500],
-                voice={"mode": "id", "id": voice_id},
-                output_format={"container": "mp3", "bit_rate": 128000, "sample_rate": 44100},
-            ):
-                yield chunk.audio
+            with openai_client.audio.speech.with_streaming_response.create(
+                model="tts-1",
+                voice=voice,
+                input=text[:300],
+            ) as response:
+                for chunk in response.iter_bytes(chunk_size=4096):
+                    yield chunk
 
         return StreamingResponse(generate(), media_type="audio/mpeg")
     except Exception as e:
