@@ -38,7 +38,17 @@ except Exception as e:
     logger.error(f"❌ ERROR creating Groq client: {e}")
     client = None
 
-openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+openai_client = None
+try:
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_api_key:
+        logger.warning("⚠️ OPENAI_API_KEY not set")
+    else:
+        openai_client = openai.OpenAI(api_key=openai_api_key)
+        logger.info("✅ OpenAI client initialized successfully")
+except Exception as e:
+    logger.error(f"❌ ERROR creating OpenAI client: {e}")
+    openai_client = None
 
 usage_tracker = {}
 
@@ -203,8 +213,8 @@ async def text_to_speech(data: dict):
     text = data.get("text", "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
-    if client is None:
-        raise HTTPException(status_code=503, detail="AI service unavailable")
+    if openai_client is None:
+        raise HTTPException(status_code=503, detail="TTS service unavailable: OPENAI_API_KEY not set")
     try:
         response = openai_client.audio.speech.create(
             model="tts-1",
