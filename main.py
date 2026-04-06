@@ -211,6 +211,7 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
 @app.post("/tts")
 async def text_to_speech(data: dict):
     text = data.get("text", "").strip()
+    voice = data.get("voice", "onyx")
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
     if openai_client is None:
@@ -218,7 +219,7 @@ async def text_to_speech(data: dict):
     try:
         response = openai_client.audio.speech.create(
             model="tts-1",
-            voice="onyx",
+            voice=voice,
             input=text[:500],
         )
         audio_bytes = response.content
