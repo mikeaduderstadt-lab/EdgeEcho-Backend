@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import openai
 from groq import Groq
+from cartesia import Cartesia
 from dotenv import load_dotenv
 
 # Set up logging
@@ -49,6 +50,29 @@ try:
 except Exception as e:
     logger.error(f"❌ ERROR creating OpenAI client: {e}")
     openai_client = None
+
+cartesia_client = None
+try:
+    cartesia_api_key = os.environ.get("CARTESIA_API_KEY")
+    if not cartesia_api_key:
+        logger.warning("⚠️ CARTESIA_API_KEY not set")
+    else:
+        cartesia_client = Cartesia(api_key=cartesia_api_key)
+        logger.info("✅ Cartesia client initialized successfully")
+except Exception as e:
+    logger.error(f"❌ ERROR creating Cartesia client: {e}")
+    cartesia_client = None
+
+# Map OpenAI voice names to Cartesia voice IDs
+# Update these IDs from https://play.cartesia.ai/voices
+CARTESIA_VOICE_MAP = {
+    "onyx":   "638efaaa-4d0c-442e-b701-3fae16aad012",  # deep male
+    "nova":   "a0e99841-438c-4a64-b679-ae501e7d6091",  # female
+    "alloy":  "248be419-c632-4f23-adf1-5324ed7dbf1d",  # neutral
+    "echo":   "15a9cd88-84b0-4a8b-95f2-5d583b54c72e",  # male
+    "fable":  "79a125e8-cd45-4c13-8a67-188112f4dd22",  # expressive
+    "shimmer":"e3827ec5-697a-4b7c-9704-1a23041bbc51",  # warm female
+}
 
 usage_tracker = {}
 
@@ -214,19 +238,22 @@ async def text_to_speech(data: dict):
     voice = data.get("voice", "onyx")
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
-    if openai_client is None:
-        raise HTTPException(status_code=503, detail="TTS service unavailable: OPENAI_API_KEY not set")
+    if cartesia_client is None:
+        raise HTTPException(status_code=503, detail="TTS service unavailable: CARTESIA_API_KEY not set")
     try:
-        response = openai_client.audio.speech.create(
-            model="tts-1",
-            voice=voice,
-            input=text[:500],
-        )
-        logger.info(f"TTS streaming started for: {text[:50]}...")
-        return StreamingResponse(
-            response.iter_bytes(),
-            media_type="audio/mpeg",
-        )
+        voice_id = CARTESIA_VOICE_MAP.get(voice, CARTESIA_VOICE_MAP["onyx"])
+        logger.info(f"TTS streaming started (Cartesia sonic-2, voice={voice}) for: {text[:50]}...")
+
+        def generate():
+            for chunk in cartesia_client.tts.sse(
+                model_id="sonic-2",
+                transcript=text[:500],
+                voice={"mode": "id", "id": voice_id},
+                output_format={"container": "mp3", "bit_rate": 128000, "sample_rate": 44100},
+            ):
+                yield chunk.audio
+
+        return StreamingResponse(generate(), media_type="audio/mpeg")
     except Exception as e:
         import traceback
         logger.error(f"TTS error: {type(e).__name__}: {e}")
