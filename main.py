@@ -6,7 +6,7 @@ import logging
 import urllib.parse
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from deepgram import DeepgramClient, PrerecordedOptions
+from deepgram import DeepgramClient
 from fastapi.responses import StreamingResponse
 import openai
 from groq import Groq
