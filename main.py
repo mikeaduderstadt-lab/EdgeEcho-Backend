@@ -4,8 +4,9 @@ import tempfile
 import time
 import logging
 import urllib.parse
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from deepgram import DeepgramClient, PrerecordedOptions
 from fastapi.responses import StreamingResponse
 import openai
 from groq import Groq
@@ -76,6 +77,18 @@ CARTESIA_VOICE_MAP = {
     "shimmer":"e3827ec5-697a-4b7c-9704-1a23041bbc51",  # warm female
 }
 
+deepgram_client = None
+try:
+    deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY")
+    if not deepgram_api_key:
+        logger.warning("⚠️ DEEPGRAM_API_KEY not set")
+    else:
+        deepgram_client = DeepgramClient(deepgram_api_key)
+        logger.info("✅ Deepgram client initialized successfully")
+except Exception as e:
+    logger.error(f"❌ ERROR creating Deepgram client: {e}")
+    deepgram_client = None
+
 usage_tracker = {}
 
 @app.get("/")
@@ -94,6 +107,29 @@ async def health():
 async def get_founder_spots():
     import random
     return {"remaining": random.randint(12, 47)}
+
+@app.post("/transcribe")
+async def transcribe(request: Request):
+    if deepgram_client is None:
+        raise HTTPException(status_code=503, detail="Transcription service unavailable: DEEPGRAM_API_KEY not set")
+    try:
+        audio_bytes = await request.body()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="No audio data provided")
+
+        options = PrerecordedOptions(model="nova-2", smart_format=True)
+        response = deepgram_client.listen.prerecorded.v("1").transcribe_file(
+            {"buffer": audio_bytes},
+            options,
+        )
+        transcript = response.results.channels[0].alternatives[0].transcript
+        return {"transcript": transcript}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Deepgram transcribe error: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
+
 
 @app.post("/process_audio")
 async def process_audio(
