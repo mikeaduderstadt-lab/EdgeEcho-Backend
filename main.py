@@ -23,7 +23,11 @@ app = FastAPI(title="CerebroEcho API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://cerebroecho-frontend.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Transcript", "X-Answer", "X-Questions-Used"],
