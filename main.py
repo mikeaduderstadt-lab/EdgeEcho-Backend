@@ -131,6 +131,105 @@ async def transcribe(request: Request):
         raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
 
 
+@app.post("/coach")
+async def coach(
+    transcript: str = Form(None),
+    audio: UploadFile = File(None),
+    file: UploadFile = File(None),
+    deviceId: str = Form(...),
+    userEmail: str = Form("anonymous"),
+    context: str = Form("a professional role"),
+    work_history: str = Form(""),
+    style: str = Form("script")
+):
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
+
+    user_key = f"{deviceId}_{userEmail}"
+    current_used = usage_tracker.get(user_key, 0)
+    limit = 999
+    if current_used >= limit:
+        raise HTTPException(status_code=403, detail={"code": "TRIAL_LIMIT_REACHED", "message": f"Trial limit reached ({limit} questions)"})
+
+    start_time = time.time()
+    temp_filename = None
+
+    try:
+        # --- Transcript path: pre-transcribed text provided by frontend (e.g. Deepgram streaming) ---
+        if transcript and transcript.strip():
+            transcript = transcript.strip()
+            logger.info(f"📝 Using pre-transcribed text: {transcript[:80]}...")
+        else:
+            # --- Audio path: run Groq Whisper STT ---
+            actual_file = audio or file
+            if not actual_file:
+                raise HTTPException(status_code=400, detail="Provide either 'transcript' text or an audio file")
+
+            content = await actual_file.read()
+            if len(content) < 1000:
+                return {"answer": "Listening...", "transcript": "", "questions_used": current_used, "processing_time": round(time.time() - start_time, 3)}
+
+            logger.info(f"📝 Transcribing {len(content)} bytes via Whisper...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+                tmp.write(content)
+                temp_filename = tmp.name
+
+            with open(temp_filename, "rb") as af:
+                transcription = client.audio.transcriptions.create(
+                    file=(temp_filename, af.read(), "audio/webm"),
+                    model="whisper-large-v3-turbo",
+                    response_format="text",
+                )
+
+            if temp_filename and os.path.exists(temp_filename):
+                os.unlink(temp_filename)
+                temp_filename = None
+
+            transcript = transcription.strip() if transcription else ""
+            if not transcript or len(transcript) < 2:
+                return {"answer": "Listening...", "transcript": "", "questions_used": current_used, "processing_time": round(time.time() - start_time, 3)}
+
+        logger.info(f"✅ Transcript: {transcript[:80]}...")
+
+        if style == "shorthand":
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}\nProvide ONE hint or framework name only. Max 10 words."
+            max_tokens = 50
+        elif style == "bullet":
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}\nProvide 3 tactical bullet points. Max 100 words total."
+            max_tokens = 200
+        else:
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}\nProvide a 2-3 sentence tactical answer. Be concise and confident."
+            max_tokens = 150
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Interview question: {transcript}"}
+            ],
+            temperature=0.6,
+            max_tokens=max_tokens,
+            top_p=0.9
+        )
+
+        answer = completion.choices[0].message.content.strip()
+        usage_tracker[user_key] = current_used + 1
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Answer generated in {processing_time:.2f}s")
+
+        return {"transcript": transcript, "answer": answer, "questions_used": usage_tracker[user_key], "processing_time": round(processing_time, 3)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ /coach ERROR: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        if temp_filename and os.path.exists(temp_filename):
+            os.unlink(temp_filename)
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+
 @app.post("/process_audio")
 async def process_audio(
     audio: UploadFile = File(None),
