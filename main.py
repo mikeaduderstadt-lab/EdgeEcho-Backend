@@ -213,6 +213,7 @@ async def coach(
     style: str = Form("script"),
     session_history: str = Form(""),
     prior_summaries: str = Form(""),
+    filter_small_talk: str = Form("false"),
 ):
     if client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
@@ -275,6 +276,19 @@ async def coach(
 
         # Update buffer with current (possibly merged) transcript
         question_buffer[user_key] = {"transcript": transcript, "timestamp": time.time()}
+
+        # === SMALL TALK FILTER ===
+        if filter_small_talk.lower() == "true":
+            check = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": f"Is this interview small talk or personal conversation rather than a professional interview question? Answer only YES or NO: {transcript}"}],
+                temperature=0.0,
+                max_tokens=5,
+            )
+            verdict = check.choices[0].message.content.strip().upper()
+            logger.info(f"🤫 Small talk check: '{transcript[:50]}' → {verdict}")
+            if verdict.startswith("YES"):
+                return {"answer": "", "transcript": transcript, "filtered": True, "questions_used": current_used}
 
         # Parse memory context
         try:
