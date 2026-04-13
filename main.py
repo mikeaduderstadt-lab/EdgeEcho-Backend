@@ -1,9 +1,12 @@
 import io
 import os
+import sqlite3
+import json
 import tempfile
 import time
 import logging
 import urllib.parse
+from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from deepgram import DeepgramClient
@@ -91,6 +94,27 @@ except Exception as e:
 
 usage_tracker = {}
 
+# ========================
+# SESSION MEMORY DATABASE
+# ========================
+DB_PATH = os.environ.get("DB_PATH", "cerebroecho.db")
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            user_email TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            summary TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
 @app.get("/")
 async def root():
     return {"status": "CerebroEcho Backend Live", "version": "1.2.0"}
@@ -140,7 +164,9 @@ async def coach(
     userEmail: str = Form("anonymous"),
     context: str = Form("a professional role"),
     work_history: str = Form(""),
-    style: str = Form("script")
+    style: str = Form("script"),
+    session_history: str = Form(""),
+    prior_summaries: str = Form(""),
 ):
     if client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
@@ -191,22 +217,40 @@ async def coach(
 
         logger.info(f"✅ Transcript: {transcript[:80]}...")
 
+        # Parse memory context
+        try:
+            prior = json.loads(prior_summaries) if prior_summaries else []
+        except Exception:
+            prior = []
+        try:
+            history = json.loads(session_history) if session_history else []
+        except Exception:
+            history = []
+
+        prior_context = ""
+        if prior:
+            prior_context = "\n\nPREVIOUS INTERVIEW SESSIONS:\n" + "\n---\n".join(prior)
+
         if style == "shorthand":
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}\nProvide ONE hint or framework name only. Max 10 words."
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide ONE hint or framework name only. Max 10 words."
             max_tokens = 50
         elif style == "bullet":
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}\nProvide 3 tactical bullet points. Max 100 words total."
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide 3 tactical bullet points. Max 100 words total."
             max_tokens = 200
         else:
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}\nProvide a 2-3 sentence tactical answer. Be concise and confident."
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide a 2-3 sentence tactical answer. Be concise and confident."
             max_tokens = 150
+
+        # Build messages with rolling session history as conversation turns
+        messages = [{"role": "system", "content": system_prompt}]
+        for turn in history[-5:]:
+            messages.append({"role": "user", "content": f"Interview question: {turn['question']}"})
+            messages.append({"role": "assistant", "content": turn['answer']})
+        messages.append({"role": "user", "content": f"Interview question: {transcript}"})
 
         completion = client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Interview question: {transcript}"}
-            ],
+            messages=messages,
             temperature=0.6,
             max_tokens=max_tokens,
             top_p=0.9
@@ -512,6 +556,109 @@ async def text_to_speech(data: dict):
         logger.error(f"TTS error: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"TTS error: {type(e).__name__}: {str(e)}")
+
+@app.post("/session/start")
+async def session_start(data: dict):
+    device_id = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT summary FROM sessions WHERE device_id=? AND user_email=? ORDER BY created_at DESC LIMIT 3",
+            (device_id, user_email)
+        ).fetchall()
+        conn.close()
+        summaries = [r[0] for r in rows]
+    except Exception as e:
+        logger.error(f"session/start DB error: {e}")
+        summaries = []
+    return {"prior_summaries": summaries}
+
+
+@app.post("/session/end")
+async def session_end(data: dict):
+    device_id = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+    history = data.get("history", [])
+
+    if not history:
+        return {"status": "skipped"}
+
+    if client is not None and len(history) >= 2:
+        history_text = "\n".join([f"Q: {h['question']}\nA: {h['answer']}" for h in history[-10:]])
+        summary_prompt = f"""Summarize this interview session concisely in 150 words or less. Include:
+- Key topics discussed
+- Names or companies mentioned
+- Candidate's stated experience/background
+- Interviewer's apparent style and focus areas
+
+Session transcript:
+{history_text}"""
+        try:
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": summary_prompt}],
+                temperature=0.3,
+                max_tokens=200,
+            )
+            summary = completion.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Summary generation failed: {e}")
+            summary = f"Session with {len(history)} exchanges."
+    else:
+        summary = f"Session with {len(history)} exchanges."
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO sessions (device_id, user_email, created_at, summary) VALUES (?, ?, ?, ?)",
+            (device_id, user_email, datetime.utcnow().isoformat(), summary)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"session/end DB write error: {e}")
+        return {"status": "error", "detail": str(e)}
+
+    logger.info(f"📝 Session saved for {user_email}: {summary[:60]}...")
+    return {"status": "saved", "summary": summary}
+
+
+@app.post("/quick_transcribe")
+async def quick_transcribe(
+    audio: UploadFile = File(None),
+    file: UploadFile = File(None),
+):
+    """Fast STT-only endpoint for question continuation detection."""
+    if client is None:
+        raise HTTPException(status_code=503, detail="STT service unavailable")
+    actual_file = audio or file
+    if not actual_file:
+        raise HTTPException(status_code=400, detail="No audio file provided")
+
+    content = await actual_file.read()
+    if len(content) < 1000:
+        return {"transcript": ""}
+
+    temp_filename = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+            tmp.write(content)
+            temp_filename = tmp.name
+        with open(temp_filename, "rb") as af:
+            transcription = client.audio.transcriptions.create(
+                file=(temp_filename, af.read(), "audio/webm"),
+                model="whisper-large-v3-turbo",
+                response_format="text",
+            )
+        return {"transcript": transcription.strip() if transcription else ""}
+    except Exception as e:
+        logger.error(f"quick_transcribe error: {e}")
+        return {"transcript": ""}
+    finally:
+        if temp_filename and os.path.exists(temp_filename):
+            os.unlink(temp_filename)
+
 
 @app.post("/save_email")
 async def save_email(data: dict):
