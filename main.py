@@ -95,6 +95,52 @@ except Exception as e:
 usage_tracker = {}
 
 # ========================
+# RETROSPECTIVE QUESTION ASSEMBLY
+# ========================
+# Keyed by user_key → {"transcript": str, "timestamp": float}
+question_buffer: dict = {}
+CONTINUATION_TIMEOUT_S = 15.0
+
+FRAGMENT_ENDINGS = [
+    r'tell me about$', r'tell us about$', r'what would you$', r'how do you$',
+    r'can you$', r'could you$', r'describe$', r'explain$',
+    r'walk me$', r'walk us$', r'give me$', r'give us$',
+    r'what is$', r'what are$', r'why did$', r'when did$',
+    r'how did$', r'have you$', r'do you$', r'did you$',
+    r'are you$', r'were you$', r'would you$', r'should you$',
+    r'tell me$', r'tell us$',
+]
+
+def _looks_like_continuation(prev: str, new: str) -> bool:
+    """True if `new` appears to continue an incomplete `prev`."""
+    import re
+    prev = prev.strip()
+    new = new.strip()
+    new_words = new.split()
+
+    # Very short new fragment (< 5 words) is almost always a continuation
+    if len(new_words) < 5:
+        return True
+
+    # Starts with a connector/subordinator — mid-thought continuation
+    if re.match(
+        r'^(and|but|or|so|because|since|while|when|if|that|which|who|'
+        r'specifically|particularly|for example|such as|in terms of|regarding)\b',
+        new, re.IGNORECASE
+    ):
+        return True
+
+    # Previous ended as an incomplete phrase (no terminal punctuation + known fragment ending)
+    prev_no_punct = not re.search(r'[.?!]$', prev)
+    prev_is_fragment = prev_no_punct and any(
+        re.search(p, prev, re.IGNORECASE) for p in FRAGMENT_ENDINGS
+    )
+    if prev_is_fragment:
+        return True
+
+    return False
+
+# ========================
 # SESSION MEMORY DATABASE
 # ========================
 DB_PATH = os.environ.get("DB_PATH", "cerebroecho.db")
@@ -217,6 +263,19 @@ async def coach(
 
         logger.info(f"✅ Transcript: {transcript[:80]}...")
 
+        # === RETROSPECTIVE QUESTION ASSEMBLY ===
+        merged = False
+        buf_entry = question_buffer.get(user_key)
+        if buf_entry and (time.time() - buf_entry["timestamp"]) <= CONTINUATION_TIMEOUT_S:
+            if _looks_like_continuation(buf_entry["transcript"], transcript):
+                combined = buf_entry["transcript"].rstrip() + " " + transcript
+                logger.info(f"🔗 Merging: '{buf_entry['transcript'][:50]}' + '{transcript[:50]}'")
+                transcript = combined
+                merged = True
+
+        # Update buffer with current (possibly merged) transcript
+        question_buffer[user_key] = {"transcript": transcript, "timestamp": time.time()}
+
         # Parse memory context
         try:
             prior = json.loads(prior_summaries) if prior_summaries else []
@@ -261,7 +320,7 @@ async def coach(
         processing_time = time.time() - start_time
         logger.info(f"✅ Answer generated in {processing_time:.2f}s")
 
-        return {"transcript": transcript, "answer": answer, "questions_used": usage_tracker[user_key], "processing_time": round(processing_time, 3)}
+        return {"transcript": transcript, "answer": answer, "questions_used": usage_tracker[user_key], "processing_time": round(processing_time, 3), "merged": merged}
 
     except HTTPException:
         raise
