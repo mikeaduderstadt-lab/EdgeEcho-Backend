@@ -488,18 +488,20 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
 async def text_to_speech(data: dict):
     text = data.get("text", "").strip()
     voice = data.get("voice", "onyx")
+    speed = float(data.get("speed", 1.0))
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
     if openai_client is None:
         raise HTTPException(status_code=503, detail="TTS service unavailable: OPENAI_API_KEY not set")
     try:
-        logger.info(f"TTS streaming started (OpenAI tts-1, voice={voice}) for: {text[:50]}...")
+        logger.info(f"TTS streaming started (OpenAI tts-1, voice={voice}, speed={speed}) for: {text[:50]}...")
 
         def generate():
             with openai_client.audio.speech.with_streaming_response.create(
                 model="tts-1",
                 voice=voice,
                 input=text[:300],
+                speed=speed,
             ) as response:
                 for chunk in response.iter_bytes(chunk_size=4096):
                     yield chunk
