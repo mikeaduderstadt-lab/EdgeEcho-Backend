@@ -330,6 +330,7 @@ async def coach(
         )
 
         answer = completion.choices[0].message.content.strip()
+        logger.info(f"✅ Full answer text ({len(answer)} chars): {answer[:100]}...")
         usage_tracker[user_key] = current_used + 1
         processing_time = time.time() - start_time
         logger.info(f"✅ Answer generated in {processing_time:.2f}s")
@@ -604,6 +605,7 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
 @app.post("/tts")
 async def text_to_speech(data: dict):
     text = data.get("text", "").strip()
+    logger.info(f"📢 TTS received ({len(text)} chars): {text[:100]}...")
     voice = data.get("voice", "onyx")
     speed = float(data.get("speed", 1.0))
     if not text:
@@ -617,7 +619,7 @@ async def text_to_speech(data: dict):
             with openai_client.audio.speech.with_streaming_response.create(
                 model="tts-1",
                 voice=voice,
-                input=text[:300],
+                input=text,
                 speed=speed,
             ) as response:
                 for chunk in response.iter_bytes(chunk_size=4096):
