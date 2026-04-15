@@ -624,7 +624,7 @@ async def text_to_speech(data: dict):
                     "model_id": "sonic-3",
                     "transcript": text,
                     "voice": {"mode": "id", "id": "f9836c6e-a0bd-460e-9d3c-f7299fa60f94"},
-                    "output_format": {"container": "wav", "encoding": "pcm_f32le", "sample_rate": 44100},
+                    "output_format": {"container": "mp3", "bit_rate": 128000},
                     "speed": "normal",
                     "generation_config": {"speed": 1, "volume": 1},
                 },
@@ -633,7 +633,7 @@ async def text_to_speech(data: dict):
             resp.raise_for_status()
             audio_bytes = resp.content
             logger.info(f"TTS via Cartesia Sonic-3 ({len(audio_bytes)} bytes)")
-            return Response(content=audio_bytes, media_type="audio/wav")
+            return Response(content=audio_bytes, media_type="audio/mpeg")
         except Exception as e:
             logger.error(f"Cartesia TTS failed: {e}, falling back to OpenAI")
 
