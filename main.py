@@ -10,7 +10,7 @@ from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from deepgram import DeepgramClient
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 import openai
 from groq import Groq
 from cartesia import Cartesia
@@ -305,13 +305,13 @@ async def coach(
             prior_context = "\n\nPREVIOUS INTERVIEW SESSIONS:\n" + "\n---\n".join(prior)
 
         if style == "shorthand":
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide ONE hint or framework name only. Max 10 words."
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide ONE hint or framework name only. Max 10 words.\nReturn ONLY the answer the candidate should say. No preamble, no labels, no 'Here\\'s a tactical answer' prefix. Start directly with the answer."
             max_tokens = 50
         elif style == "bullet":
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide 3 tactical bullet points. Max 100 words total."
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide 3 tactical bullet points. Max 100 words total.\nReturn ONLY the answer the candidate should say. No preamble, no labels, no 'Here\\'s a tactical answer' prefix. Start directly with the answer."
             max_tokens = 200
         else:
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide a 2-3 sentence tactical answer. Be concise and confident."
+            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide a 2-3 sentence tactical answer. Be concise and confident.\nReturn ONLY the answer the candidate should say. No preamble, no labels, no 'Here\\'s a tactical answer' prefix. Start directly with the answer."
             max_tokens = 150
 
         # Build messages with rolling session history as conversation turns
@@ -606,12 +606,42 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
 async def text_to_speech(data: dict):
     text = data.get("text", "").strip()
     logger.info(f"📢 TTS received ({len(text)} chars): {text[:100]}...")
-    voice = data.get("voice", "onyx")
-    speed = float(data.get("speed", 1.0))
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
+
+    cartesia_api_key = os.environ.get("CARTESIA_API_KEY")
+    if cartesia_api_key:
+        try:
+            import httpx
+            resp = httpx.post(
+                "https://api.cartesia.ai/tts/bytes",
+                headers={
+                    "Cartesia-Version": "2025-04-16",
+                    "X-API-Key": cartesia_api_key,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model_id": "sonic-3",
+                    "transcript": text,
+                    "voice": {"mode": "id", "id": "f9836c6e-a0bd-460e-9d3c-f7299fa60f94"},
+                    "output_format": {"container": "wav", "encoding": "pcm_f32le", "sample_rate": 44100},
+                    "speed": "normal",
+                    "generation_config": {"speed": 1, "volume": 1},
+                },
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            audio_bytes = resp.content
+            logger.info(f"TTS via Cartesia Sonic-3 ({len(audio_bytes)} bytes)")
+            return Response(content=audio_bytes, media_type="audio/wav")
+        except Exception as e:
+            logger.error(f"Cartesia TTS failed: {e}, falling back to OpenAI")
+
+    # Fallback: OpenAI TTS
     if openai_client is None:
-        raise HTTPException(status_code=503, detail="TTS service unavailable: OPENAI_API_KEY not set")
+        raise HTTPException(status_code=503, detail="TTS service unavailable: neither CARTESIA_API_KEY nor OPENAI_API_KEY is set")
+    voice = data.get("voice", "onyx")
+    speed = float(data.get("speed", 1.0))
     try:
         logger.info(f"TTS streaming started (OpenAI tts-1, voice={voice}, speed={speed}) for: {text[:50]}...")
 
