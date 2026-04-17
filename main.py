@@ -613,6 +613,7 @@ async def text_to_speech(data: dict):
     if cartesia_api_key:
         try:
             import httpx
+            logger.info(f"🎙️ Calling Cartesia with format: mp3")
             resp = httpx.post(
                 "https://api.cartesia.ai/tts/bytes",
                 headers={
@@ -635,7 +636,8 @@ async def text_to_speech(data: dict):
             logger.info(f"TTS via Cartesia Sonic-3 ({len(audio_bytes)} bytes)")
             return Response(content=audio_bytes, media_type="audio/mpeg")
         except Exception as e:
-            logger.error(f"Cartesia TTS failed: {e}, falling back to OpenAI")
+            import traceback
+            logger.error(f"Cartesia failed: {traceback.format_exc()}")
 
     # Fallback: OpenAI TTS
     if openai_client is None:
@@ -643,6 +645,7 @@ async def text_to_speech(data: dict):
     voice = data.get("voice", "onyx")
     speed = float(data.get("speed", 1.0))
     try:
+        logger.warning("⚠️ USING OPENAI FALLBACK — Cartesia failed")
         logger.info(f"TTS streaming started (OpenAI tts-1, voice={voice}, speed={speed}) for: {text[:50]}...")
 
         def generate():
