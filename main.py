@@ -618,24 +618,31 @@ async def text_to_speech(data: dict):
                 "transcript": text,
                 "voice": {"mode": "id", "id": "f9836c6e-a0bd-460e-9d3c-f7299fa60f94"},
                 "output_format": {"container": "mp3", "bit_rate": 128000, "sample_rate": 44100},
-                "speed": "normal",
+                "speed": 0.9,
                 "generation_config": {"speed": 1, "volume": 1},
             }
             logger.info(f"🎙️ Cartesia request body: {json.dumps(payload)}")
-            resp = httpx.post(
-                "https://api.cartesia.ai/tts/bytes",
-                headers={
-                    "Cartesia-Version": "2025-04-16",
-                    "X-API-Key": cartesia_api_key,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            audio_bytes = resp.content
-            logger.info(f"TTS via Cartesia Sonic-3 ({len(audio_bytes)} bytes)")
-            return Response(content=audio_bytes, media_type="audio/mpeg")
+            cartesia_headers = {
+                "Cartesia-Version": "2025-04-16",
+                "X-API-Key": cartesia_api_key,
+                "Content-Type": "application/json",
+            }
+
+            def cartesia_stream():
+                with httpx.Client() as client:
+                    with client.stream(
+                        "POST",
+                        "https://api.cartesia.ai/tts/bytes",
+                        headers=cartesia_headers,
+                        json=payload,
+                        timeout=30.0,
+                    ) as resp:
+                        resp.raise_for_status()
+                        logger.info("✅ Cartesia streaming started")
+                        for chunk in resp.iter_bytes(chunk_size=1024):
+                            yield chunk
+
+            return StreamingResponse(cartesia_stream(), media_type="audio/mpeg")
         except Exception as e:
             import traceback
             logger.error(f"Cartesia failed: {traceback.format_exc()}")
