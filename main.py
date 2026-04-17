@@ -613,7 +613,15 @@ async def text_to_speech(data: dict):
     if cartesia_api_key:
         try:
             import httpx
-            logger.info(f"🎙️ Calling Cartesia with format: mp3")
+            payload = {
+                "model_id": "sonic-3",
+                "transcript": text,
+                "voice": {"mode": "id", "id": "f9836c6e-a0bd-460e-9d3c-f7299fa60f94"},
+                "output_format": {"container": "mp3", "bit_rate": 128000, "sample_rate": 44100},
+                "speed": "normal",
+                "generation_config": {"speed": 1, "volume": 1},
+            }
+            logger.info(f"🎙️ Cartesia request body: {json.dumps(payload)}")
             resp = httpx.post(
                 "https://api.cartesia.ai/tts/bytes",
                 headers={
@@ -621,14 +629,7 @@ async def text_to_speech(data: dict):
                     "X-API-Key": cartesia_api_key,
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model_id": "sonic-3",
-                    "transcript": text,
-                    "voice": {"mode": "id", "id": "f9836c6e-a0bd-460e-9d3c-f7299fa60f94"},
-                    "output_format": {"container": "mp3", "bit_rate": 128000},
-                    "speed": "normal",
-                    "generation_config": {"speed": 1, "volume": 1},
-                },
+                json=payload,
                 timeout=30.0,
             )
             resp.raise_for_status()
