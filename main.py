@@ -610,6 +610,7 @@ async def text_to_speech(data: dict):
         raise HTTPException(status_code=400, detail="No text provided")
 
     speed = float(data.get("speed", 0.85))
+    voice_id = data.get("voice_id", "f9836c6e-a0bd-460e-9d3c-f7299fa60f94")
 
     cartesia_api_key = os.environ.get("CARTESIA_API_KEY")
     if cartesia_api_key:
@@ -618,7 +619,7 @@ async def text_to_speech(data: dict):
             payload = {
                 "model_id": "sonic-3",
                 "transcript": text,
-                "voice": {"mode": "id", "id": "f9836c6e-a0bd-460e-9d3c-f7299fa60f94"},
+                "voice": {"mode": "id", "id": voice_id},
                 "output_format": {"container": "mp3", "bit_rate": 128000, "sample_rate": 44100},
                 "speed": speed,
                 "generation_config": {"speed": 1, "volume": 1},
