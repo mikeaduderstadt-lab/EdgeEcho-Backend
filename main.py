@@ -609,6 +609,8 @@ async def text_to_speech(data: dict):
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
 
+    speed = float(data.get("speed", 0.85))
+
     cartesia_api_key = os.environ.get("CARTESIA_API_KEY")
     if cartesia_api_key:
         try:
@@ -618,7 +620,7 @@ async def text_to_speech(data: dict):
                 "transcript": text,
                 "voice": {"mode": "id", "id": "f9836c6e-a0bd-460e-9d3c-f7299fa60f94"},
                 "output_format": {"container": "mp3", "bit_rate": 128000, "sample_rate": 44100},
-                "speed": 0.9,
+                "speed": speed,
                 "generation_config": {"speed": 1, "volume": 1},
             }
             logger.info(f"🎙️ Cartesia request body: {json.dumps(payload)}")
@@ -651,7 +653,6 @@ async def text_to_speech(data: dict):
     if openai_client is None:
         raise HTTPException(status_code=503, detail="TTS service unavailable: neither CARTESIA_API_KEY nor OPENAI_API_KEY is set")
     voice = data.get("voice", "onyx")
-    speed = float(data.get("speed", 1.0))
     try:
         logger.warning("⚠️ USING OPENAI FALLBACK — Cartesia failed")
         logger.info(f"TTS streaming started (OpenAI tts-1, voice={voice}, speed={speed}) for: {text[:50]}...")
