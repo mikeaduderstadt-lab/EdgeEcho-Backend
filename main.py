@@ -7,6 +7,7 @@ import time
 import logging
 import urllib.parse
 from datetime import datetime
+import stripe
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from deepgram import DeepgramClient
@@ -776,6 +777,38 @@ async def quick_transcribe(
     finally:
         if temp_filename and os.path.exists(temp_filename):
             os.unlink(temp_filename)
+
+
+STRIPE_PRICE_IDS = {
+    "text": "price_1TPT4fEl32Rmtak4Wi2kydYT",
+    "audio": "price_1TPT7eEl32Rmtak48vQHQkj6",
+    "forever": "price_1TPTEDEl32Rmtak4kfGIpFcY",
+}
+
+@app.post("/create-checkout")
+async def create_checkout(data: dict):
+    plan = data.get("plan")
+    if plan not in STRIPE_PRICE_IDS:
+        raise HTTPException(status_code=400, detail="Invalid plan. Must be text, audio, or forever.")
+
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY")
+    if not stripe_key:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+
+    stripe.api_key = stripe_key
+    mode = "payment" if plan == "forever" else "subscription"
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode=mode,
+            line_items=[{"price": STRIPE_PRICE_IDS[plan], "quantity": 1}],
+            success_url="https://cerebroecho.com/app?payment=success",
+            cancel_url="https://cerebroecho.com/app?payment=cancelled",
+        )
+        return {"url": session.url}
+    except stripe.StripeError as e:
+        logger.error(f"Stripe error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/save_email")
