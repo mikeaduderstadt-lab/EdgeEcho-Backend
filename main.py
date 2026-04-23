@@ -95,6 +95,9 @@ except Exception as e:
 
 usage_tracker = {}
 
+# Keyed by Stripe customer ID → {"plan": str, "status": "active"|"payment_failed"|"revoked"}
+customer_plan: dict = {}
+
 # ========================
 # RETROSPECTIVE QUESTION ASSEMBLY
 # ========================
@@ -809,6 +812,54 @@ async def create_checkout(data: dict):
     except stripe.StripeError as e:
         logger.error(f"Stripe error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+    if not webhook_secret:
+        raise HTTPException(status_code=503, detail="Webhook secret not configured")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+    except stripe.errors.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    event_type = event["type"]
+    data = event["data"]["object"]
+
+    if event_type == "checkout.session.completed":
+        customer_id = data.get("customer")
+        plan_name = data.get("metadata", {}).get("plan", "unknown")
+        if customer_id:
+            customer_plan[customer_id] = {"plan": plan_name, "status": "active"}
+            logger.info(f"✅ checkout.session.completed: customer={customer_id} plan={plan_name}")
+
+    elif event_type == "customer.subscription.created":
+        customer_id = data.get("customer")
+        if customer_id:
+            existing = customer_plan.get(customer_id, {})
+            customer_plan[customer_id] = {"plan": existing.get("plan", "unknown"), "status": "active"}
+            logger.info(f"✅ customer.subscription.created: customer={customer_id}")
+
+    elif event_type == "customer.subscription.deleted":
+        customer_id = data.get("customer")
+        if customer_id:
+            existing = customer_plan.get(customer_id, {})
+            customer_plan[customer_id] = {"plan": existing.get("plan", "unknown"), "status": "revoked"}
+            logger.info(f"🚫 customer.subscription.deleted: customer={customer_id}")
+
+    elif event_type == "invoice.payment_failed":
+        customer_id = data.get("customer")
+        if customer_id:
+            existing = customer_plan.get(customer_id, {})
+            customer_plan[customer_id] = {"plan": existing.get("plan", "unknown"), "status": "payment_failed"}
+            logger.info(f"⚠️ invoice.payment_failed: customer={customer_id}")
+
+    return {"received": True}
 
 
 @app.post("/save_email")
