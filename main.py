@@ -231,6 +231,8 @@ def build_system_prompt(
     context: str = "",
     work_history: str = "",
     prior_context: str = "",
+    session_context: str = "",
+    user_preferences: str = "",
 ) -> tuple:
     parts = [ROLE_PROMPTS.get(role, _DEFAULT_ROLE)]
 
@@ -240,6 +242,10 @@ def build_system_prompt(
         parts.append(f"User background: {work_history}")
     if prior_context:
         parts.append(prior_context)
+    if session_context and session_context.strip():
+        parts.append(f"Context provided by user:\n{session_context.strip()[:6000]}")
+    if user_preferences and user_preferences.strip():
+        parts.append(f"User preferences: {user_preferences.strip()}")
 
     persona_mod = PERSONA_MODIFIERS.get(persona, "")
     if persona_mod:
@@ -399,6 +405,8 @@ async def coach(
     session_history: str = Form(""),
     prior_summaries: str = Form(""),
     filter_small_talk: str = Form("false"),
+    session_context: str = Form(""),
+    user_preferences: str = Form(""),
 ):
     if client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
@@ -496,8 +504,10 @@ async def coach(
             context=context,
             work_history=work_history,
             prior_context=prior_context,
+            session_context=session_context,
+            user_preferences=user_preferences,
         )
-        logger.info(f"🧠 Role={role} | Persona={persona} | Style={style} | max_tokens={max_tokens}")
+        logger.info(f"🧠 Role={role} | Persona={persona} | Style={style} | ctx={len(session_context)}c | prefs={len(user_preferences)}c | max_tokens={max_tokens}")
 
         # Build messages with rolling session history as conversation turns
         messages = [{"role": "system", "content": system_prompt}]
@@ -963,6 +973,164 @@ async def quick_transcribe(
     finally:
         if temp_filename and os.path.exists(temp_filename):
             os.unlink(temp_filename)
+
+
+# ========================
+# CONTEXT UPLOAD
+# ========================
+
+@app.post("/upload-context")
+async def upload_context(
+    file: UploadFile = File(...),
+    deviceId: str = Form(""),
+):
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    filename = file.filename.lower()
+    content_type = (file.content_type or "").lower()
+
+    if not (filename.endswith(".pdf") or filename.endswith(".txt")
+            or "pdf" in content_type or "text" in content_type):
+        raise HTTPException(status_code=400, detail="Only PDF and TXT files are supported")
+
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Maximum 5MB.")
+
+    extracted = ""
+    if filename.endswith(".txt") or "text" in content_type:
+        try:
+            extracted = content.decode("utf-8", errors="replace")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read text file: {e}")
+    else:
+        try:
+            from pypdf import PdfReader
+            import io as _io
+            reader = PdfReader(_io.BytesIO(content))
+            pages = [p.extract_text() for p in reader.pages if p.extract_text()]
+            extracted = "\n\n".join(pages)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not read PDF: {e}")
+
+    if len(extracted) > 8000:
+        extracted = extracted[:8000] + "...[truncated]"
+
+    logger.info(f"📄 upload-context: {file.filename} → {len(extracted)} chars")
+    return {"text": extracted, "filename": file.filename, "chars": len(extracted)}
+
+
+# ========================
+# URL BRIEFING (PERPLEXITY)
+# ========================
+
+@app.post("/brief")
+async def brief_url(data: dict):
+    url = data.get("url", "").strip()
+    device_id = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+
+    if not url:
+        raise HTTPException(status_code=400, detail="No URL provided")
+
+    perplexity_key = os.environ.get("PERPLEXITY_API_KEY")
+    if not perplexity_key:
+        raise HTTPException(status_code=503, detail="Briefing service unavailable: PERPLEXITY_API_KEY not set")
+
+    prompt = (
+        f"Research the following URL and provide a concise brief covering: "
+        f"key facts, likely topics of conversation, potential objections or questions "
+        f"that may arise, and any relevant background information. URL: {url}"
+    )
+
+    try:
+        import httpx as _httpx
+        resp = _httpx.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={
+                "Authorization": f"Bearer {perplexity_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "sonar",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 600,
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        brief_text = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error(f"Perplexity API error: {e}")
+        raise HTTPException(status_code=500, detail=f"Briefing failed: {str(e)}")
+
+    # Deduct 5 credits
+    if engine is not None:
+        user_id = f"{device_id}_{user_email}"
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    INSERT INTO credits (user_id, balance, plan_type, total_used)
+                    VALUES (:uid, -5, 'free', 5)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        balance = credits.balance - 5,
+                        total_used = credits.total_used + 5
+                """), {"uid": user_id})
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Credits deduction error: {e}")
+
+    logger.info(f"🔍 Brief generated for {url} ({len(brief_text)} chars), 5 credits deducted")
+    return {"brief": brief_text, "url": url, "credits_used": 5}
+
+
+# ========================
+# PREFERENCES
+# ========================
+
+@app.get("/preferences")
+async def get_preferences(deviceId: str, userEmail: str = "anonymous"):
+    if engine is None:
+        return {"preference_text": ""}
+    user_id = f"{deviceId}_{userEmail}"
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT preference_text FROM preferences WHERE user_id=:uid"),
+                {"uid": user_id}
+            ).fetchone()
+        return {"preference_text": row[0] if row else ""}
+    except Exception as e:
+        logger.error(f"get_preferences error: {e}")
+        return {"preference_text": ""}
+
+
+@app.post("/preferences")
+async def save_preferences(data: dict):
+    device_id = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+    preference_text = data.get("preference_text", "")
+
+    if engine is None:
+        return {"status": "skipped"}
+
+    user_id = f"{device_id}_{user_email}"
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO preferences (user_id, preference_text, updated_at)
+                VALUES (:uid, :text, :now)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    preference_text = EXCLUDED.preference_text,
+                    updated_at = EXCLUDED.updated_at
+            """), {"uid": user_id, "text": preference_text, "now": datetime.utcnow().isoformat()})
+            conn.commit()
+        logger.info(f"⚙️ Preferences saved for {user_id}")
+        return {"status": "saved"}
+    except Exception as e:
+        logger.error(f"save_preferences error: {e}")
+        return {"status": "error", "detail": str(e)}
 
 
 STRIPE_PRICE_IDS = {
