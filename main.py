@@ -517,6 +517,7 @@ async def coach(
     filter_small_talk: str = Form("false"),
     session_context: str = Form(""),
     user_preferences: str = Form(""),
+    ghost_mode: str = Form("false"),
 ):
     if client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
@@ -533,6 +534,11 @@ async def coach(
         role = "Interview Coach"
     if persona in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
         persona = "Diplomat"
+
+    # Free plan: Nudge + Brief only (no Full — 4-credit responses)
+    if plan_type == "free" and style == "Full":
+        style = "Brief"
+        cost = STYLE_COSTS["Brief"]
 
     if credits["balance"] < cost:
         raise HTTPException(status_code=402, detail={
@@ -561,6 +567,9 @@ async def coach(
                 return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "tts_allowed": tts_allowed, "processing_time": round(time.time() - start_time, 3)}
 
             logger.info(f"📝 Transcribing {len(content)} bytes via Whisper...")
+            # AUDIO RETENTION: temp file required by Groq file API (cannot stream bytes directly).
+            # Written to OS temp dir, read once for transcription, then immediately deleted.
+            # Raw audio never reaches the database or any storage layer.
             with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
                 tmp.write(content)
                 temp_filename = tmp.name
@@ -572,6 +581,7 @@ async def coach(
                     response_format="text",
                 )
 
+            # AUDIO RETENTION: temp file deleted immediately after transcription.
             if temp_filename and os.path.exists(temp_filename):
                 os.unlink(temp_filename)
                 temp_filename = None
@@ -592,8 +602,9 @@ async def coach(
                 transcript = combined
                 merged = True
 
-        # Update buffer with current (possibly merged) transcript
-        question_buffer[user_key] = {"transcript": transcript, "timestamp": time.time()}
+        # Ghost mode: no traces — skip question buffer update
+        if ghost_mode.lower() != "true":
+            question_buffer[user_key] = {"transcript": transcript, "timestamp": time.time()}
 
         # === SMALL TALK FILTER ===
         if filter_small_talk.lower() == "true":
@@ -692,19 +703,8 @@ async def process_audio(
     if not actual_file:
         raise HTTPException(status_code=400, detail="No audio file provided")
     
-    # Usage tracking
+    # Legacy endpoint — credits are the gate now; usage_tracker kept for reference only
     user_key = f"{deviceId}_{userEmail}"
-    current_used = usage_tracker.get(user_key, 0)
-    limit = 999  # TODO: restore to (10 if userEmail != "anonymous" else 5) before launch
-    
-    if current_used >= limit:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "TRIAL_LIMIT_REACHED",
-                "message": f"Trial limit reached ({limit} questions)"
-            }
-        )
     
     temp_filename = None
     
@@ -725,16 +725,16 @@ async def process_audio(
             }
         
         logger.info(f"📝 Transcribing {len(content)} bytes...")
-        
-        # Save to temp file with .webm extension
+
+        # AUDIO RETENTION: temp file exists only for the duration of the Groq API call.
+        # Raw audio bytes are never written to database or object storage.
         with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
             temp_file.write(content)
             temp_filename = temp_file.name
-        
-        # THE FIX: Add "audio/webm" as the 3rd parameter in the tuple
+
         with open(temp_filename, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
-                file=(temp_filename, audio_file.read(), "audio/webm"),  # ✅ MIME type added
+                file=(temp_filename, audio_file.read(), "audio/webm"),
                 model="whisper-large-v3-turbo",
                 response_format="text",
             )
@@ -830,12 +830,7 @@ async def process_and_speak(
     if not actual_file:
         raise HTTPException(status_code=400, detail="No audio file provided")
 
-    user_key = f"{deviceId}_{userEmail}"
-    current_used = usage_tracker.get(user_key, 0)
-    limit = 999
-    if current_used >= limit:
-        raise HTTPException(status_code=403, detail={"code": "TRIAL_LIMIT_REACHED", "message": f"Trial limit reached ({limit} questions)"})
-
+    # Legacy endpoint — credits are the gate now
     temp_filename = None
     try:
         start_time = time.time()
@@ -844,6 +839,7 @@ async def process_and_speak(
         if len(content) < 1000:
             raise HTTPException(status_code=400, detail="Audio too short")
 
+        # AUDIO RETENTION: temp file used only for Groq API call; deleted immediately after.
         with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
             temp_file.write(content)
             temp_filename = temp_file.name
@@ -1284,6 +1280,12 @@ async def end_session(data: dict):
     style      = data.get("style", "Nudge")
     transcript = data.get("transcript", [])
     duration_seconds = int(data.get("duration_seconds", 0))
+    ghost_mode = bool(data.get("ghost_mode", False))
+
+    # Ghost mode: process nothing, store nothing, leave no trace
+    if ghost_mode:
+        logger.info(f"👻 Ghost session ended — no data stored")
+        return {"status": "ghost", "summary": ""}
 
     if not transcript or len(transcript) < 2:
         return {"status": "skipped", "summary": ""}
