@@ -1,6 +1,5 @@
 import io
 import os
-import sqlite3
 import json
 import tempfile
 import time
@@ -8,6 +7,7 @@ import logging
 import urllib.parse
 from datetime import datetime
 import stripe
+from sqlalchemy import create_engine, text
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from deepgram import DeepgramClient
@@ -145,23 +145,91 @@ def _looks_like_continuation(prev: str, new: str) -> bool:
     return False
 
 # ========================
-# SESSION MEMORY DATABASE
+# DATABASE — PostgreSQL via SQLAlchemy
 # ========================
-DB_PATH = os.environ.get("DB_PATH", "cerebroecho.db")
+_raw_db_url = os.environ.get("DATABASE_URL", "")
+# Railway sometimes issues postgres:// — SQLAlchemy 2.x requires postgresql://
+if _raw_db_url.startswith("postgres://"):
+    _raw_db_url = _raw_db_url.replace("postgres://", "postgresql://", 1)
+
+engine = None
+if _raw_db_url:
+    try:
+        engine = create_engine(_raw_db_url, pool_pre_ping=True, pool_size=5, max_overflow=10)
+        logger.info("✅ PostgreSQL engine created")
+    except Exception as e:
+        logger.error(f"❌ Failed to create DB engine: {e}")
+else:
+    logger.warning("⚠️ DATABASE_URL not set — session persistence disabled")
+
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
+    if engine is None:
+        return
+    ddl = [
+        # Existing table — preserved exactly
+        """
         CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id TEXT NOT NULL,
-            user_email TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            summary TEXT NOT NULL
+            id          SERIAL PRIMARY KEY,
+            device_id   TEXT NOT NULL,
+            user_email  TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            summary     TEXT NOT NULL
         )
-    """)
-    conn.commit()
-    conn.close()
+        """,
+        # Credits / plan tracking per user
+        """
+        CREATE TABLE IF NOT EXISTS credits (
+            id          SERIAL PRIMARY KEY,
+            user_id     TEXT NOT NULL UNIQUE,
+            balance     INTEGER NOT NULL DEFAULT 0,
+            plan_type   TEXT NOT NULL DEFAULT 'free',
+            reset_date  TEXT,
+            total_used  INTEGER NOT NULL DEFAULT 0
+        )
+        """,
+        # Session history log
+        """
+        CREATE TABLE IF NOT EXISTS session_history (
+            id               SERIAL PRIMARY KEY,
+            session_id       TEXT NOT NULL,
+            user_id          TEXT NOT NULL,
+            role             TEXT,
+            persona          TEXT,
+            style            TEXT,
+            summary          TEXT,
+            timestamp        TEXT NOT NULL,
+            duration_seconds INTEGER NOT NULL DEFAULT 0
+        )
+        """,
+        # Long-term user preferences for memory
+        """
+        CREATE TABLE IF NOT EXISTS preferences (
+            id               SERIAL PRIMARY KEY,
+            user_id          TEXT NOT NULL UNIQUE,
+            preference_text  TEXT NOT NULL DEFAULT '',
+            updated_at       TEXT NOT NULL
+        )
+        """,
+        # Founding 50 members
+        """
+        CREATE TABLE IF NOT EXISTS founding_members (
+            id                SERIAL PRIMARY KEY,
+            user_id           TEXT NOT NULL UNIQUE,
+            purchase_date     TEXT NOT NULL,
+            stripe_payment_id TEXT NOT NULL
+        )
+        """,
+    ]
+    try:
+        with engine.connect() as conn:
+            for stmt in ddl:
+                conn.execute(text(stmt))
+            conn.commit()
+        logger.info("✅ All database tables verified / created")
+    except Exception as e:
+        logger.error(f"❌ init_db error: {e}")
+
 
 init_db()
 
@@ -684,12 +752,13 @@ async def session_start(data: dict):
     device_id = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
     try:
-        conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute(
-            "SELECT summary FROM sessions WHERE device_id=? AND user_email=? ORDER BY created_at DESC LIMIT 3",
-            (device_id, user_email)
-        ).fetchall()
-        conn.close()
+        if engine is None:
+            raise RuntimeError("No database configured")
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT summary FROM sessions WHERE device_id=:did AND user_email=:email ORDER BY created_at DESC LIMIT 3"),
+                {"did": device_id, "email": user_email}
+            ).fetchall()
         summaries = [r[0] for r in rows]
     except Exception as e:
         logger.error(f"session/start DB error: {e}")
@@ -731,13 +800,14 @@ Session transcript:
         summary = f"Session with {len(history)} exchanges."
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "INSERT INTO sessions (device_id, user_email, created_at, summary) VALUES (?, ?, ?, ?)",
-            (device_id, user_email, datetime.utcnow().isoformat(), summary)
-        )
-        conn.commit()
-        conn.close()
+        if engine is None:
+            raise RuntimeError("No database configured")
+        with engine.connect() as conn:
+            conn.execute(
+                text("INSERT INTO sessions (device_id, user_email, created_at, summary) VALUES (:did, :email, :created_at, :summary)"),
+                {"did": device_id, "email": user_email, "created_at": datetime.utcnow().isoformat(), "summary": summary}
+            )
+            conn.commit()
     except Exception as e:
         logger.error(f"session/end DB write error: {e}")
         return {"status": "error", "detail": str(e)}
