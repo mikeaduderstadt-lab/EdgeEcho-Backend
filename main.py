@@ -145,6 +145,117 @@ def _looks_like_continuation(prev: str, new: str) -> bool:
     return False
 
 # ========================
+# SYSTEM PROMPT CONSTRUCTION
+# ========================
+
+ROLE_PROMPTS = {
+    "Interview Coach": (
+        "You are a real-time interview coaching assistant. Help the user "
+        "translate their experience into sharp, relevant, confident answers. "
+        "Flag weak phrasing. Suggest stronger framing. Keep answers concise and story-driven."
+    ),
+    "Sales": (
+        "You are a real-time sales coaching assistant. Help the user handle "
+        "objections, clarify value, and move the conversation toward a decision. "
+        "Be direct. Focus on outcomes, not features."
+    ),
+    "Negotiation": (
+        "You are a real-time negotiation assistant. Help the user find leverage, "
+        "protect their downside, and avoid saying too much. Know when to hold silence. "
+        "Never concede without getting something back."
+    ),
+    "Customer Service": (
+        "You are a real-time customer service assistant. Help the user stay calm, "
+        "clear, and solution-focused even when the conversation gets tense. "
+        "De-escalate when needed. Never match aggression."
+    ),
+    "Social/Dating": (
+        "You are a real-time social coaching assistant. Help the user stay engaging, "
+        "genuine, and confident in social or dating conversations. "
+        "Keep it light when the moment calls for it. Read the room."
+    ),
+    "Fact Checker": (
+        "You are a real-time fact checking assistant. Flag incorrect or misleading "
+        "claims as they appear in conversation. Be precise. Cite your reasoning. "
+        "Do not editorialize."
+    ),
+}
+
+PERSONA_MODIFIERS = {
+    "Diplomat": (
+        "Respond with measured precision. De-escalate where possible. "
+        "Choose words that preserve relationships while holding position."
+    ),
+    "Strategist": (
+        "See the full board. Frame every response around tradeoffs, timing, and leverage. "
+        "Think three moves ahead."
+    ),
+    "Closer": (
+        "Be direct and outcome-oriented. Every response should move something forward. "
+        "Minimal warmth. Maximum clarity."
+    ),
+    "Coach": (
+        "Be calm, supportive, and human. Acknowledge emotion before strategy. "
+        "Make the user feel capable."
+    ),
+    "Analyst": (
+        "Lead with evidence. Be skeptical of assumptions. Flag weak logic. "
+        "Keep opinions clearly labeled as opinions."
+    ),
+    "Pirate": (
+        "Be blunt. Be opportunistic. Say the thing no one else will. "
+        "Zero tolerance for nonsense. No softening. No apology."
+    ),
+}
+
+STYLE_CONFIG = {
+    "Nudge":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
+    "Brief":     {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
+    "Full":      {"instruction": "Respond with complete, polished phrasing. Up to 2000 characters. Use when the moment requires a fully formed response.", "max_tokens": 550},
+    # Legacy aliases kept for backward compatibility
+    "shorthand": {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters.", "max_tokens": 80},
+    "bullet":    {"instruction": "Provide 3 tactical bullet points. Max 100 words total.", "max_tokens": 200},
+    "script":    {"instruction": "Provide a 2-3 sentence tactical answer. Be concise and confident.", "max_tokens": 150},
+}
+
+_DEFAULT_ROLE = (
+    "You are a real-time conversation coaching assistant. "
+    "Help the user navigate the conversation with clarity and confidence."
+)
+
+
+def build_system_prompt(
+    role: str,
+    persona: str,
+    style: str,
+    context: str = "",
+    work_history: str = "",
+    prior_context: str = "",
+) -> tuple:
+    parts = [ROLE_PROMPTS.get(role, _DEFAULT_ROLE)]
+
+    if context and context not in ("", "a professional role"):
+        parts.append(f"Session context: {context}")
+    if work_history and work_history not in ("", "no work history provided"):
+        parts.append(f"User background: {work_history}")
+    if prior_context:
+        parts.append(prior_context)
+
+    persona_mod = PERSONA_MODIFIERS.get(persona, "")
+    if persona_mod:
+        parts.append(persona_mod)
+
+    style_cfg = STYLE_CONFIG.get(style, STYLE_CONFIG["Nudge"])
+    parts.append(style_cfg["instruction"])
+    parts.append(
+        "Return ONLY the answer the user should say. "
+        "No preamble, no labels, no meta-commentary. Start directly with the answer."
+    )
+
+    return "\n\n".join(parts), style_cfg["max_tokens"]
+
+
+# ========================
 # DATABASE — PostgreSQL via SQLAlchemy
 # ========================
 _raw_db_url = os.environ.get("DATABASE_URL", "")
@@ -282,7 +393,9 @@ async def coach(
     userEmail: str = Form("anonymous"),
     context: str = Form("a professional role"),
     work_history: str = Form(""),
-    style: str = Form("script"),
+    style: str = Form("Nudge"),
+    role: str = Form("Interview Coach"),
+    persona: str = Form("Diplomat"),
     session_history: str = Form(""),
     prior_summaries: str = Form(""),
     filter_small_talk: str = Form("false"),
@@ -374,17 +487,17 @@ async def coach(
 
         prior_context = ""
         if prior:
-            prior_context = "\n\nPREVIOUS INTERVIEW SESSIONS:\n" + "\n---\n".join(prior)
+            prior_context = "PREVIOUS SESSIONS:\n" + "\n---\n".join(prior)
 
-        if style == "shorthand":
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide ONE hint or framework name only. Max 10 words.\nReturn ONLY the answer the candidate should say. No preamble, no labels, no 'Here\\'s a tactical answer' prefix. Start directly with the answer."
-            max_tokens = 50
-        elif style == "bullet":
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide 3 tactical bullet points. Max 100 words total.\nReturn ONLY the answer the candidate should say. No preamble, no labels, no 'Here\\'s a tactical answer' prefix. Start directly with the answer."
-            max_tokens = 200
-        else:
-            system_prompt = f"You are an elite interview coach. The candidate is interviewing for {context}.\nTheir background: {work_history}{prior_context}\nProvide a 2-3 sentence tactical answer. Be concise and confident.\nReturn ONLY the answer the candidate should say. No preamble, no labels, no 'Here\\'s a tactical answer' prefix. Start directly with the answer."
-            max_tokens = 150
+        system_prompt, max_tokens = build_system_prompt(
+            role=role,
+            persona=persona,
+            style=style,
+            context=context,
+            work_history=work_history,
+            prior_context=prior_context,
+        )
+        logger.info(f"🧠 Role={role} | Persona={persona} | Style={style} | max_tokens={max_tokens}")
 
         # Build messages with rolling session history as conversation turns
         messages = [{"role": "system", "content": system_prompt}]
