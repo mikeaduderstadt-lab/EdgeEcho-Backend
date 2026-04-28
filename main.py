@@ -5,7 +5,7 @@ import tempfile
 import time
 import logging
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 import stripe
 from sqlalchemy import create_engine, text
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
@@ -93,7 +93,99 @@ except Exception as e:
     logger.error(f"❌ ERROR creating Deepgram client: {e}")
     deepgram_client = None
 
-usage_tracker = {}
+# ========================
+# CREDIT SYSTEM
+# ========================
+PLAN_CREDITS = {
+    "free":        30,     # one-time, never resets
+    "echo":        400,    # monthly
+    "pro":         1000,   # monthly
+    "command":     2500,   # monthly
+    "operator":    6000,   # monthly
+    "founding_50": 1000,   # monthly
+}
+
+STYLE_COSTS = {
+    "Nudge":     1,
+    "Brief":     2,
+    "Full":      4,
+    # legacy aliases
+    "shorthand": 1,
+    "bullet":    2,
+    "script":    2,
+}
+
+
+def _get_credit_balance(user_id: str) -> dict:
+    """Get or create credits record; returns {balance, plan_type, total_used}."""
+    if engine is None:
+        return {"balance": 9999, "plan_type": "free", "total_used": 0}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO credits (user_id, balance, plan_type, total_used)
+                VALUES (:uid, 30, 'free', 0)
+                ON CONFLICT (user_id) DO NOTHING
+            """), {"uid": user_id})
+            conn.commit()
+            row = conn.execute(
+                text("SELECT balance, plan_type, total_used FROM credits WHERE user_id=:uid"),
+                {"uid": user_id}
+            ).fetchone()
+        if row:
+            return {"balance": row[0], "plan_type": row[1], "total_used": row[2]}
+    except Exception as e:
+        logger.error(f"_get_credit_balance error: {e}")
+    return {"balance": 9999, "plan_type": "free", "total_used": 0}
+
+
+def _deduct_credits(user_id: str, cost: int) -> int:
+    """Deduct credits; returns new balance or -1 on error."""
+    if engine is None:
+        return -1
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                UPDATE credits
+                SET balance   = GREATEST(0, balance - :cost),
+                    total_used = total_used + :cost
+                WHERE user_id = :uid
+                RETURNING balance
+            """), {"cost": cost, "uid": user_id}).fetchone()
+            conn.commit()
+        return result[0] if result else -1
+    except Exception as e:
+        logger.error(f"_deduct_credits error: {e}")
+        return -1
+
+
+def reset_expired_credits():
+    """Reset balances for any user whose reset_date has passed (runs at startup)."""
+    if engine is None:
+        return
+    now = datetime.utcnow().isoformat()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT user_id, plan_type FROM credits
+                WHERE reset_date IS NOT NULL AND reset_date <= :now
+            """), {"now": now}).fetchall()
+            for uid, plan in rows:
+                new_bal = PLAN_CREDITS.get(plan, 30)
+                new_reset = (datetime.utcnow() + timedelta(days=30)).isoformat()
+                conn.execute(text("""
+                    UPDATE credits
+                    SET balance = :bal, reset_date = :reset, total_used = 0
+                    WHERE user_id = :uid
+                """), {"bal": new_bal, "reset": new_reset, "uid": uid})
+            if rows:
+                conn.commit()
+                logger.info(f"🔄 Monthly credits reset for {len(rows)} users")
+    except Exception as e:
+        logger.error(f"reset_expired_credits error: {e}")
+
+
+usage_tracker = {}  # kept for non-primary endpoints only
 
 # Keyed by Stripe customer ID → {"plan": str, "status": "active"|"payment_failed"|"revoked"}
 customer_plan: dict = {}
@@ -351,6 +443,7 @@ def init_db():
 
 
 init_db()
+reset_expired_credits()
 
 @app.get("/")
 async def root():
@@ -414,10 +507,16 @@ async def coach(
         raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
 
     user_key = f"{deviceId}_{userEmail}"
-    current_used = usage_tracker.get(user_key, 0)
-    limit = 999
-    if current_used >= limit:
-        raise HTTPException(status_code=403, detail={"code": "TRIAL_LIMIT_REACHED", "message": f"Trial limit reached ({limit} questions)"})
+    # ── Credit check ──
+    cost = STYLE_COSTS.get(style, 1)
+    credits = _get_credit_balance(user_key)
+    if credits["balance"] < cost:
+        raise HTTPException(status_code=402, detail={
+            "code": "INSUFFICIENT_CREDITS",
+            "message": "Insufficient credits. Upgrade your plan or purchase an overage pack.",
+            "balance": credits["balance"],
+            "cost": cost,
+        })
 
     start_time = time.time()
     temp_filename = None
@@ -435,7 +534,7 @@ async def coach(
 
             content = await actual_file.read()
             if len(content) < 1000:
-                return {"answer": "Listening...", "transcript": "", "questions_used": current_used, "processing_time": round(time.time() - start_time, 3)}
+                return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "processing_time": round(time.time() - start_time, 3)}
 
             logger.info(f"📝 Transcribing {len(content)} bytes via Whisper...")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
@@ -455,7 +554,7 @@ async def coach(
 
             transcript = transcription.strip() if transcription else ""
             if not transcript or len(transcript) < 2:
-                return {"answer": "Listening...", "transcript": "", "questions_used": current_used, "processing_time": round(time.time() - start_time, 3)}
+                return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "processing_time": round(time.time() - start_time, 3)}
 
         logger.info(f"✅ Transcript: {transcript[:80]}...")
 
@@ -483,7 +582,7 @@ async def coach(
             verdict = check.choices[0].message.content.strip().upper()
             logger.info(f"🤫 Small talk check: '{transcript[:50]}' → {verdict}")
             if verdict.startswith("YES"):
-                return {"answer": "", "transcript": transcript, "filtered": True, "questions_used": current_used}
+                return {"answer": "", "transcript": transcript, "filtered": True, "credits_remaining": credits["balance"]}
 
         # Parse memory context
         try:
@@ -528,11 +627,13 @@ async def coach(
 
         answer = completion.choices[0].message.content.strip()
         logger.info(f"✅ Full answer text ({len(answer)} chars): {answer[:100]}...")
-        usage_tracker[user_key] = current_used + 1
+        credits_remaining = _deduct_credits(user_key, cost)
+        if credits_remaining < 0:
+            credits_remaining = max(0, credits["balance"] - cost)
         processing_time = time.time() - start_time
-        logger.info(f"✅ Answer generated in {processing_time:.2f}s")
+        logger.info(f"✅ Answer generated in {processing_time:.2f}s | -{cost} credits → {credits_remaining} remaining")
 
-        return {"transcript": transcript, "answer": answer, "questions_used": usage_tracker[user_key], "processing_time": round(processing_time, 3), "merged": merged}
+        return {"transcript": transcript, "answer": answer, "credits_remaining": credits_remaining, "processing_time": round(processing_time, 3), "merged": merged}
 
     except HTTPException:
         raise
@@ -1232,6 +1333,13 @@ async def get_session_history(deviceId: str, userEmail: str = "anonymous"):
     except Exception as e:
         logger.error(f"get_session_history error: {e}")
         return {"sessions": []}
+
+
+@app.get("/credits")
+async def get_credits(deviceId: str, userEmail: str = "anonymous"):
+    user_id = f"{deviceId}_{userEmail}"
+    data = _get_credit_balance(user_id)
+    return {"balance": data["balance"], "plan_type": data["plan_type"], "total_used": data["total_used"]}
 
 
 STRIPE_PRICE_IDS = {
