@@ -337,6 +337,8 @@ def init_db():
             stripe_payment_id TEXT NOT NULL
         )
         """,
+        # Unique index on session_id so end-session is idempotent
+        "CREATE UNIQUE INDEX IF NOT EXISTS session_history_sid_uniq ON session_history(session_id)",
     ]
     try:
         with engine.connect() as conn:
@@ -1131,6 +1133,105 @@ async def save_preferences(data: dict):
     except Exception as e:
         logger.error(f"save_preferences error: {e}")
         return {"status": "error", "detail": str(e)}
+
+
+# ========================
+# SESSION HISTORY
+# ========================
+
+@app.post("/end-session")
+async def end_session(data: dict):
+    session_id = data.get("session_id", "")
+    device_id  = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+    role       = data.get("role", "Interview Coach")
+    persona    = data.get("persona", "Diplomat")
+    style      = data.get("style", "Nudge")
+    transcript = data.get("transcript", [])
+    duration_seconds = int(data.get("duration_seconds", 0))
+
+    if not transcript or len(transcript) < 2:
+        return {"status": "skipped", "summary": ""}
+
+    # One-sentence summary via Groq
+    summary = f"Session with {len(transcript)} exchanges."
+    if client is not None:
+        history_text = "\n".join(
+            [f"Q: {t.get('question','')}\nA: {t.get('answer','')}" for t in transcript[-10:]]
+        )
+        prompt = (
+            "Summarize this conversation in one sentence of under 20 words. "
+            "Focus on what happened and what the outcome was.\n\n" + history_text
+        )
+        try:
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=60,
+            )
+            summary = completion.choices[0].message.content.strip().rstrip(".")
+        except Exception as e:
+            logger.error(f"end-session summary error: {e}")
+
+    # Persist to session_history
+    user_id = f"{device_id}_{user_email}"
+    if engine is not None and session_id:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    INSERT INTO session_history
+                        (session_id, user_id, role, persona, style, summary, timestamp, duration_seconds)
+                    VALUES (:sid, :uid, :role, :persona, :style, :summary, :ts, :dur)
+                    ON CONFLICT (session_id) DO UPDATE SET summary = EXCLUDED.summary
+                """), {
+                    "sid": session_id,
+                    "uid": user_id,
+                    "role": role,
+                    "persona": persona,
+                    "style": style,
+                    "summary": summary,
+                    "ts": datetime.utcnow().isoformat(),
+                    "dur": duration_seconds,
+                })
+                conn.commit()
+        except Exception as e:
+            logger.error(f"end-session DB error: {e}")
+
+    logger.info(f"📝 end-session {session_id[:8]}… | {role}/{persona} | {duration_seconds}s | {summary[:50]}")
+    return {"status": "saved", "summary": summary}
+
+
+@app.get("/session-history")
+async def get_session_history(deviceId: str, userEmail: str = "anonymous"):
+    if engine is None:
+        return {"sessions": []}
+    user_id = f"{deviceId}_{userEmail}"
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                FROM session_history
+                WHERE user_id = :uid
+                ORDER BY timestamp DESC
+                LIMIT 50
+            """), {"uid": user_id}).fetchall()
+        sessions = [
+            {
+                "session_id": r[0],
+                "role": r[1],
+                "persona": r[2],
+                "style": r[3],
+                "summary": r[4],
+                "timestamp": r[5],
+                "duration_seconds": r[6],
+            }
+            for r in rows
+        ]
+        return {"sessions": sessions}
+    except Exception as e:
+        logger.error(f"get_session_history error: {e}")
+        return {"sessions": []}
 
 
 STRIPE_PRICE_IDS = {
