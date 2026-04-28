@@ -429,6 +429,14 @@ def init_db():
             stripe_payment_id TEXT NOT NULL
         )
         """,
+        # Stripe customer ID → user_id mapping (for subscription cancellation)
+        """
+        CREATE TABLE IF NOT EXISTS stripe_customers (
+            customer_id TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        )
+        """,
         # Unique index on session_id so end-session is idempotent
         "CREATE UNIQUE INDEX IF NOT EXISTS session_history_sid_uniq ON session_history(session_id)",
     ]
@@ -459,8 +467,15 @@ async def health():
 
 @app.get("/founder_spots")
 async def get_founder_spots():
-    import random
-    return {"remaining": random.randint(12, 47)}
+    count = 0
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("SELECT COUNT(*) FROM founding_members")).fetchone()
+                count = row[0] if row else 0
+        except Exception as e:
+            logger.error(f"founder_spots error: {e}")
+    return {"remaining": max(0, 50 - count), "claimed": count}
 
 @app.post("/transcribe")
 async def transcribe(request: Request):
@@ -507,9 +522,18 @@ async def coach(
         raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
 
     user_key = f"{deviceId}_{userEmail}"
-    # ── Credit check ──
+    # ── Credit check + plan metadata ──
     cost = STYLE_COSTS.get(style, 1)
     credits = _get_credit_balance(user_key)
+    plan_type = credits["plan_type"]
+    tts_allowed = plan_type in TTS_ALLOWED_PLANS
+
+    # Silently downgrade operator-only options for lower plans
+    if role in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
+        role = "Interview Coach"
+    if persona in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
+        persona = "Diplomat"
+
     if credits["balance"] < cost:
         raise HTTPException(status_code=402, detail={
             "code": "INSUFFICIENT_CREDITS",
@@ -534,7 +558,7 @@ async def coach(
 
             content = await actual_file.read()
             if len(content) < 1000:
-                return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "processing_time": round(time.time() - start_time, 3)}
+                return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "tts_allowed": tts_allowed, "processing_time": round(time.time() - start_time, 3)}
 
             logger.info(f"📝 Transcribing {len(content)} bytes via Whisper...")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
@@ -554,7 +578,7 @@ async def coach(
 
             transcript = transcription.strip() if transcription else ""
             if not transcript or len(transcript) < 2:
-                return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "processing_time": round(time.time() - start_time, 3)}
+                return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "tts_allowed": tts_allowed, "processing_time": round(time.time() - start_time, 3)}
 
         logger.info(f"✅ Transcript: {transcript[:80]}...")
 
@@ -582,7 +606,7 @@ async def coach(
             verdict = check.choices[0].message.content.strip().upper()
             logger.info(f"🤫 Small talk check: '{transcript[:50]}' → {verdict}")
             if verdict.startswith("YES"):
-                return {"answer": "", "transcript": transcript, "filtered": True, "credits_remaining": credits["balance"]}
+                return {"answer": "", "transcript": transcript, "filtered": True, "credits_remaining": credits["balance"], "tts_allowed": tts_allowed}
 
         # Parse memory context
         try:
@@ -633,7 +657,7 @@ async def coach(
         processing_time = time.time() - start_time
         logger.info(f"✅ Answer generated in {processing_time:.2f}s | -{cost} credits → {credits_remaining} remaining")
 
-        return {"transcript": transcript, "answer": answer, "credits_remaining": credits_remaining, "processing_time": round(processing_time, 3), "merged": merged}
+        return {"transcript": transcript, "answer": answer, "credits_remaining": credits_remaining, "processing_time": round(processing_time, 3), "merged": merged, "tts_allowed": tts_allowed}
 
     except HTTPException:
         raise
@@ -1137,6 +1161,16 @@ async def brief_url(data: dict):
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
+    # Plan gate: Command+ only
+    user_id = f"{device_id}_{user_email}"
+    plan_info = _get_credit_balance(user_id)
+    if plan_info["plan_type"] not in BRIEFING_ALLOWED_PLANS:
+        raise HTTPException(status_code=403, detail={
+            "code": "PLAN_REQUIRED",
+            "message": "URL briefing requires Command plan or above.",
+            "required_plan": "command",
+        })
+
     perplexity_key = os.environ.get("PERPLEXITY_API_KEY")
     if not perplexity_key:
         raise HTTPException(status_code=503, detail="Briefing service unavailable: PERPLEXITY_API_KEY not set")
@@ -1254,9 +1288,13 @@ async def end_session(data: dict):
     if not transcript or len(transcript) < 2:
         return {"status": "skipped", "summary": ""}
 
-    # One-sentence summary via Groq
+    # One-sentence summary via Groq (Command+ only)
+    user_id = f"{device_id}_{user_email}"
+    plan_info = _get_credit_balance(user_id)
+    can_summarize = plan_info["plan_type"] in SUMMARY_ALLOWED_PLANS
+
     summary = f"Session with {len(transcript)} exchanges."
-    if client is not None:
+    if client is not None and can_summarize:
         history_text = "\n".join(
             [f"Q: {t.get('question','')}\nA: {t.get('answer','')}" for t in transcript[-10:]]
         )
@@ -1339,32 +1377,95 @@ async def get_session_history(deviceId: str, userEmail: str = "anonymous"):
 async def get_credits(deviceId: str, userEmail: str = "anonymous"):
     user_id = f"{deviceId}_{userEmail}"
     data = _get_credit_balance(user_id)
-    return {"balance": data["balance"], "plan_type": data["plan_type"], "total_used": data["total_used"]}
+    is_founding = False
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT 1 FROM founding_members WHERE user_id=:uid"),
+                    {"uid": user_id}
+                ).fetchone()
+                is_founding = row is not None
+        except Exception as e:
+            logger.error(f"founding check error: {e}")
+    return {
+        "balance": data["balance"],
+        "plan_type": data["plan_type"],
+        "total_used": data["total_used"],
+        "is_founding_member": is_founding,
+    }
 
 
 STRIPE_PRICE_IDS = {
-    "text": "price_1TPT4fEl32Rmtak4Wi2kydYT",
-    "audio": "price_1TPT7eEl32Rmtak48vQHQkj6",
-    "forever": "price_1TPTEDEl32Rmtak4kfGIpFcY",
+    "echo":        os.environ.get("STRIPE_PRICE_ECHO", ""),
+    "pro":         os.environ.get("STRIPE_PRICE_PRO", ""),
+    "command":     os.environ.get("STRIPE_PRICE_COMMAND", ""),
+    "operator":    os.environ.get("STRIPE_PRICE_OPERATOR", ""),
+    "founding_50": os.environ.get("STRIPE_PRICE_FOUNDING50", ""),
 }
+
+PLAN_MODES = {
+    "echo":        "subscription",
+    "pro":         "subscription",
+    "command":     "subscription",
+    "operator":    "subscription",
+    "founding_50": "payment",
+}
+
+# Plans that allow TTS audio whisper
+TTS_ALLOWED_PLANS = {"pro", "command", "operator", "founding_50"}
+
+# Plans that allow URL briefing (Perplexity)
+BRIEFING_ALLOWED_PLANS = {"command", "operator", "founding_50"}
+
+# Plans that get AI-generated session summaries
+SUMMARY_ALLOWED_PLANS = {"command", "operator", "founding_50"}
+
+# Custom role/persona requires Operator
+OPERATOR_ONLY_OPTIONS = {"Custom"}
 
 @app.post("/create-checkout")
 async def create_checkout(data: dict):
-    plan = data.get("plan")
+    plan       = data.get("plan")
+    device_id  = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+
     if plan not in STRIPE_PRICE_IDS:
-        raise HTTPException(status_code=400, detail="Invalid plan. Must be text, audio, or forever.")
+        raise HTTPException(status_code=400, detail=f"Invalid plan. Must be one of: {', '.join(STRIPE_PRICE_IDS.keys())}")
+
+    price_id = STRIPE_PRICE_IDS[plan]
+    if not price_id:
+        raise HTTPException(status_code=503, detail=f"Stripe price ID not configured for plan '{plan}'. Set STRIPE_PRICE_{plan.upper()} in Railway env vars.")
 
     stripe_key = os.environ.get("STRIPE_SECRET_KEY")
     if not stripe_key:
         raise HTTPException(status_code=503, detail="Stripe not configured")
 
     stripe.api_key = stripe_key
-    mode = "payment" if plan == "forever" else "subscription"
+
+    # Founding 50: check available seats before allowing purchase
+    if plan == "founding_50" and engine is not None:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("SELECT COUNT(*) FROM founding_members")).fetchone()
+                if row and row[0] >= 50:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "FOUNDING_SEATS_FULL",
+                        "message": "All 50 founding seats have been claimed.",
+                    })
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"founding seat check error: {e}")
+
+    mode    = PLAN_MODES[plan]
+    user_id = f"{device_id}_{user_email}"
 
     try:
         session = stripe.checkout.Session.create(
             mode=mode,
-            line_items=[{"price": STRIPE_PRICE_IDS[plan], "quantity": 1}],
+            line_items=[{"price": price_id, "quantity": 1}],
+            metadata={"plan": plan, "user_id": user_id},
             success_url="https://cerebroecho.com/app?payment=success",
             cancel_url="https://cerebroecho.com/app?payment=cancelled",
         )
@@ -1374,9 +1475,9 @@ async def create_checkout(data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/webhook")
+@app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
-    payload = await request.body()
+    payload    = await request.body()
     sig_header = request.headers.get("stripe-signature")
     webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
@@ -1388,36 +1489,79 @@ async def stripe_webhook(request: Request):
     except stripe.errors.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    event_type = event["type"]
-    data = event["data"]["object"]
+    event_type   = event["type"]
+    session_data = event["data"]["object"]
 
     if event_type == "checkout.session.completed":
-        customer_id = data.get("customer")
-        plan_name = data.get("metadata", {}).get("plan", "unknown")
-        if customer_id:
-            customer_plan[customer_id] = {"plan": plan_name, "status": "active"}
-            logger.info(f"✅ checkout.session.completed: customer={customer_id} plan={plan_name}")
+        user_id    = session_data.get("metadata", {}).get("user_id", "")
+        plan       = session_data.get("metadata", {}).get("plan", "unknown")
+        customer_id = session_data.get("customer", "")
+        payment_id  = session_data.get("payment_intent") or session_data.get("id", "")
 
-    elif event_type == "customer.subscription.created":
-        customer_id = data.get("customer")
-        if customer_id:
-            existing = customer_plan.get(customer_id, {})
-            customer_plan[customer_id] = {"plan": existing.get("plan", "unknown"), "status": "active"}
-            logger.info(f"✅ customer.subscription.created: customer={customer_id}")
+        if user_id and plan in PLAN_CREDITS and engine is not None:
+            new_balance = PLAN_CREDITS[plan]
+            reset_date  = (datetime.utcnow() + timedelta(days=30)).isoformat() if plan != "free" else None
+            try:
+                with engine.connect() as conn:
+                    # Update credits / plan
+                    conn.execute(text("""
+                        INSERT INTO credits (user_id, balance, plan_type, total_used, reset_date)
+                        VALUES (:uid, :bal, :plan, 0, :reset)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            balance    = :bal,
+                            plan_type  = :plan,
+                            total_used = 0,
+                            reset_date = :reset
+                    """), {"uid": user_id, "bal": new_balance, "plan": plan, "reset": reset_date})
+
+                    # Store customer_id → user_id mapping for subscription events
+                    if customer_id:
+                        conn.execute(text("""
+                            INSERT INTO stripe_customers (customer_id, user_id, created_at)
+                            VALUES (:cid, :uid, :now)
+                            ON CONFLICT (customer_id) DO NOTHING
+                        """), {"cid": customer_id, "uid": user_id, "now": datetime.utcnow().isoformat()})
+
+                    # Record founding member
+                    if plan == "founding_50":
+                        conn.execute(text("""
+                            INSERT INTO founding_members (user_id, purchase_date, stripe_payment_id)
+                            VALUES (:uid, :date, :pid)
+                            ON CONFLICT (user_id) DO NOTHING
+                        """), {"uid": user_id, "date": datetime.utcnow().isoformat(), "pid": payment_id})
+
+                    conn.commit()
+                logger.info(f"✅ checkout.session.completed: user={user_id} plan={plan} balance={new_balance}")
+            except Exception as e:
+                logger.error(f"webhook DB error: {e}")
 
     elif event_type == "customer.subscription.deleted":
-        customer_id = data.get("customer")
-        if customer_id:
-            existing = customer_plan.get(customer_id, {})
-            customer_plan[customer_id] = {"plan": existing.get("plan", "unknown"), "status": "revoked"}
-            logger.info(f"🚫 customer.subscription.deleted: customer={customer_id}")
+        # Downgrade to free when subscription is cancelled
+        customer_id = session_data.get("customer", "")
+        if customer_id and engine is not None:
+            try:
+                with engine.connect() as conn:
+                    row = conn.execute(
+                        text("SELECT user_id FROM stripe_customers WHERE customer_id=:cid"),
+                        {"cid": customer_id}
+                    ).fetchone()
+                    if row:
+                        uid = row[0]
+                        conn.execute(text("""
+                            UPDATE credits
+                            SET plan_type='free', balance=0, reset_date=NULL
+                            WHERE user_id=:uid
+                        """), {"uid": uid})
+                        conn.commit()
+                        logger.info(f"🚫 Subscription cancelled — downgraded {uid} to free")
+                    else:
+                        logger.warning(f"🚫 Subscription cancelled for unknown customer {customer_id}")
+            except Exception as e:
+                logger.error(f"subscription.deleted DB error: {e}")
 
     elif event_type == "invoice.payment_failed":
-        customer_id = data.get("customer")
-        if customer_id:
-            existing = customer_plan.get(customer_id, {})
-            customer_plan[customer_id] = {"plan": existing.get("plan", "unknown"), "status": "payment_failed"}
-            logger.info(f"⚠️ invoice.payment_failed: customer={customer_id}")
+        customer_id = session_data.get("customer", "")
+        logger.warning(f"⚠️ Payment failed for customer {customer_id}")
 
     return {"received": True}
 
