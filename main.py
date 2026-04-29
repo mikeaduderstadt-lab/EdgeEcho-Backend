@@ -106,10 +106,13 @@ PLAN_CREDITS = {
 }
 
 STYLE_COSTS = {
+    "Pulse":     1,
+    "Signal":    2,
+    "Compose":   4,
+    # legacy aliases
     "Nudge":     1,
     "Brief":     2,
     "Full":      4,
-    # legacy aliases
     "shorthand": 1,
     "bullet":    2,
     "script":    2,
@@ -294,17 +297,21 @@ PERSONA_MODIFIERS = {
         "Lead with evidence. Be skeptical of assumptions. Flag weak logic. "
         "Keep opinions clearly labeled as opinions."
     ),
-    "Pirate": (
-        "Be blunt. Be opportunistic. Say the thing no one else will. "
-        "Zero tolerance for nonsense. No softening. No apology."
+    "Visionary": (
+        "Think expansively. Connect dots others miss. "
+        "Reframe every problem around what becomes possible rather than what currently exists. "
+        "Lead with the bigger picture before the tactical detail."
     ),
 }
 
 STYLE_CONFIG = {
+    "Pulse":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
+    "Signal":    {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
+    "Compose":   {"instruction": "Respond with complete, polished phrasing. Up to 2000 characters. Use when the moment requires a fully formed response.", "max_tokens": 550},
+    # Legacy aliases kept for backward compatibility
     "Nudge":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
     "Brief":     {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
     "Full":      {"instruction": "Respond with complete, polished phrasing. Up to 2000 characters. Use when the moment requires a fully formed response.", "max_tokens": 550},
-    # Legacy aliases kept for backward compatibility
     "shorthand": {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters.", "max_tokens": 80},
     "bullet":    {"instruction": "Provide 3 tactical bullet points. Max 100 words total.", "max_tokens": 200},
     "script":    {"instruction": "Provide a 2-3 sentence tactical answer. Be concise and confident.", "max_tokens": 150},
@@ -535,10 +542,10 @@ async def coach(
     if persona in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
         persona = "Diplomat"
 
-    # Free plan: Nudge + Brief only (no Full — 4-credit responses)
-    if plan_type == "free" and style == "Full":
-        style = "Brief"
-        cost = STYLE_COSTS["Brief"]
+    # Free plan: Pulse + Signal only (no Compose/Full — 4-credit responses)
+    if plan_type == "free" and style in ("Full", "Compose"):
+        style = "Signal"
+        cost = STYLE_COSTS["Signal"]
 
     if credits["balance"] < cost:
         raise HTTPException(status_code=402, detail={
