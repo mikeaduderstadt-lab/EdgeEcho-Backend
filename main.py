@@ -1350,6 +1350,25 @@ async def end_session(data: dict):
     return {"status": "saved", "summary": summary}
 
 
+@app.get("/session-memory")
+async def get_session_memory(deviceId: str, userEmail: str = "anonymous"):
+    if engine is None:
+        return {"summaries": []}
+    user_id = f"{deviceId}_{userEmail}"
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT summary FROM session_history
+                WHERE user_id = :uid AND summary IS NOT NULL AND summary != ''
+                ORDER BY timestamp DESC
+                LIMIT 3
+            """), {"uid": user_id}).fetchall()
+        return {"summaries": [r[0] for r in rows]}
+    except Exception as e:
+        logger.error(f"session-memory error: {e}")
+        return {"summaries": []}
+
+
 @app.get("/session-history")
 async def get_session_history(deviceId: str, userEmail: str = "anonymous"):
     if engine is None:
