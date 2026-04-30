@@ -675,7 +675,17 @@ async def coach(
         processing_time = time.time() - start_time
         logger.info(f"✅ Answer generated in {processing_time:.2f}s | -{cost} credits → {credits_remaining} remaining")
 
-        return {"transcript": transcript, "answer": answer, "credits_remaining": credits_remaining, "processing_time": round(processing_time, 3), "merged": merged, "tts_allowed": tts_allowed}
+        # Confidence — computed from existing data, no extra API call
+        finish_reason = completion.choices[0].finish_reason
+        transcript_words = len(transcript.split())
+        if finish_reason == "length" or transcript_words < 4:
+            confidence = "low"
+        elif transcript_words < 8 or merged:
+            confidence = "medium"
+        else:
+            confidence = "high"
+
+        return {"transcript": transcript, "answer": answer, "credits_remaining": credits_remaining, "processing_time": round(processing_time, 3), "merged": merged, "tts_allowed": tts_allowed, "confidence": confidence}
 
     except HTTPException:
         raise
