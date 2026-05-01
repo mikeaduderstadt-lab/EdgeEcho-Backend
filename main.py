@@ -274,6 +274,10 @@ ROLE_PROMPTS = {
         "claims as they appear in conversation. Be precise. Cite your reasoning. "
         "Do not editorialize."
     ),
+    "Custom": """
+You are CerebroEcho in Custom Role mode.
+The user has defined their own role for this session. Apply the user's custom role description as your primary behavioral directive. Adapt your coaching style, tactics, and responses to serve whatever scenario the user has defined. If no custom description was provided, default to general conversation intelligence — help the user navigate the conversation with clarity and confidence.
+""",
 }
 
 PERSONA_MODIFIERS = {
@@ -302,6 +306,12 @@ PERSONA_MODIFIERS = {
         "Reframe every problem around what becomes possible rather than what currently exists. "
         "Lead with the bigger picture before the tactical detail."
     ),
+    "Custom": """
+The user has defined their own persona for this session. Apply the user's custom persona description to shape how you think, respond, and frame suggestions. Honor the spirit and style of their definition. If no custom description was provided, respond with balanced judgment — direct but not aggressive, clear but not cold.
+""",
+    "Pirate": """
+Respond in the voice of a classic cartoon pirate — bold, theatrical, colorful with nautical language and pirate vocabulary. Despite the colorful delivery the actual advice must still be genuinely useful and tactically sound. Never break character.
+""",
 }
 
 STYLE_CONFIG = {
@@ -458,6 +468,13 @@ def init_db():
 
 
 init_db()
+if engine is not None:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logger.info("✅ PostgreSQL connected successfully")
+    except Exception as e:
+        logger.error(f"❌ DATABASE_URL connection failed — session persistence disabled: {e}")
 reset_expired_credits()
 
 @app.get("/")
