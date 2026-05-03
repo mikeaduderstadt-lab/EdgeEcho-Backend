@@ -11,17 +11,77 @@ from sqlalchemy import create_engine, text
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from deepgram import DeepgramClient
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
 import openai
 from groq import Groq
 from cartesia import Cartesia
 from dotenv import load_dotenv
+import email_service
+import uuid as _uuid
+import secrets as _secrets
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_START_TIME = time.time()  # process start — used for uptime reporting in /health
+
 load_dotenv()
+
+# ========================
+# SENTRY ERROR TRACKING
+# ========================
+_SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+_SENTRY_ENV = os.environ.get("SENTRY_ENVIRONMENT", os.environ.get("RAILWAY_ENVIRONMENT", "production"))
+_API_VERSION = "1.2.0"
+
+_SCRUB_KEYS = frozenset({
+    "transcript", "answer", "context", "work_history",
+    "preference_text", "session_history", "prior_summaries",
+    "session_context", "user_preferences", "audio",
+    "history",  # session history arrays
+})
+
+def _sentry_before_send(event: dict, hint: dict) -> dict | None:
+    """Drop expected 4xx HTTP errors and scrub user-content fields."""
+    exc_info = hint.get("exc_info")
+    if exc_info:
+        exc = exc_info[1]
+        # 4xx errors are business logic (bad input, auth, credits) — not bugs
+        if isinstance(exc, HTTPException) and exc.status_code < 500:
+            return None
+
+    # Scrub any form/body data that could contain user content
+    req = event.get("request", {})
+    if isinstance(req.get("data"), dict):
+        req["data"] = {
+            k: ("[redacted]" if k in _SCRUB_KEYS else v)
+            for k, v in req["data"].items()
+        }
+
+    return event
+
+if _SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=_SENTRY_DSN,
+        environment=_SENTRY_ENV,
+        release=f"cerebroecho-backend@{_API_VERSION}",
+        integrations=[
+            StarletteIntegration(transaction_style="endpoint"),
+            FastApiIntegration(transaction_style="endpoint"),
+        ],
+        traces_sample_rate=0.05,   # 5% of transactions — enough for perf insight
+        send_default_pii=False,    # never send IP addresses, cookies, or auth headers
+        before_send=_sentry_before_send,
+    )
+    logger.info(f"✅ Sentry initialized (env={_SENTRY_ENV})")
+else:
+    logger.info("ℹ️  Sentry disabled — set SENTRY_DSN to enable")
 
 app = FastAPI(title="CerebroEcho API", version="1.2.0")
 
@@ -32,6 +92,48 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Transcript", "X-Answer", "X-Questions-Used"],
 )
+
+# ========================
+# RATE LIMITING
+# ========================
+# Uses in-memory store (single-instance safe on Railway).
+# NOTE: if Railway ever scales to multiple instances, swap Limiter() for
+#       Limiter(storage_uri=os.environ.get("REDIS_URL")) to share state.
+
+def get_client_ip(request: Request) -> str:
+    """Resolve real client IP — Railway sits behind a proxy."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return (request.client.host if request.client else None) or "unknown"
+
+# Configurable via Railway env vars — change without redeploying code
+RATE_COACH       = os.environ.get("RATE_LIMIT_COACH",       "30/minute")
+RATE_TTS         = os.environ.get("RATE_LIMIT_TTS",         "30/minute")
+RATE_BRIEF       = os.environ.get("RATE_LIMIT_BRIEF",       "5/minute")
+RATE_UPLOAD      = os.environ.get("RATE_LIMIT_UPLOAD",      "10/minute")
+RATE_TRANSCRIBE  = os.environ.get("RATE_LIMIT_TRANSCRIBE",  "20/minute")
+RATE_SESSION_END = os.environ.get("RATE_LIMIT_SESSION_END", "10/minute")
+RATE_CHECKOUT    = os.environ.get("RATE_LIMIT_CHECKOUT",    "10/minute")
+RATE_READS        = os.environ.get("RATE_LIMIT_READS",        "60/minute")
+RATE_AUTH_REQUEST = os.environ.get("RATE_LIMIT_AUTH_REQUEST", "5/minute")
+RATE_AUTH_VERIFY  = os.environ.get("RATE_LIMIT_AUTH_VERIFY",  "10/minute")
+
+limiter = Limiter(key_func=get_client_ip)
+app.state.limiter = limiter
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    logger.warning(f"⚠️ Rate limit exceeded: {request.url.path} from {get_client_ip(request)} — {exc.detail}")
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "rate_limit_exceeded",
+            "message": f"Too many requests ({exc.detail}). Please wait before retrying.",
+            "retry_after_seconds": 60,
+        },
+        headers={"Retry-After": "60"},
+    )
 
 # Safe Groq client initialization
 client = None
@@ -139,6 +241,7 @@ def _get_credit_balance(user_id: str) -> dict:
             return {"balance": row[0], "plan_type": row[1], "total_used": row[2]}
     except Exception as e:
         logger.error(f"_get_credit_balance error: {e}")
+        sentry_sdk.capture_exception(e)
     return {"balance": 9999, "plan_type": "free", "total_used": 0}
 
 
@@ -159,6 +262,7 @@ def _deduct_credits(user_id: str, cost: int) -> int:
         return result[0] if result else -1
     except Exception as e:
         logger.error(f"_deduct_credits error: {e}")
+        sentry_sdk.capture_exception(e)
         return -1
 
 
@@ -186,12 +290,20 @@ def reset_expired_credits():
                 logger.info(f"🔄 Monthly credits reset for {len(rows)} users")
     except Exception as e:
         logger.error(f"reset_expired_credits error: {e}")
+        sentry_sdk.capture_exception(e)
 
 
 usage_tracker = {}  # kept for non-primary endpoints only
 
 # Keyed by Stripe customer ID → {"plan": str, "status": "active"|"payment_failed"|"revoked"}
 customer_plan: dict = {}
+
+# ========================
+# AUTH CONFIG
+# ========================
+MAGIC_LINK_EXPIRY_MINUTES = int(os.environ.get("MAGIC_LINK_EXPIRY_MINUTES", "30"))
+SESSION_EXPIRY_DAYS       = int(os.environ.get("SESSION_EXPIRY_DAYS",       "30"))
+APP_BASE_URL              = os.environ.get("APP_BASE_URL", "https://cerebroecho.com/app")
 
 # ========================
 # RETROSPECTIVE QUESTION ASSEMBLY
@@ -456,6 +568,58 @@ def init_db():
         """,
         # Unique index on session_id so end-session is idempotent
         "CREATE UNIQUE INDEX IF NOT EXISTS session_history_sid_uniq ON session_history(session_id)",
+        # Idempotency log — prevents duplicate Stripe webhook processing on retries
+        """
+        CREATE TABLE IF NOT EXISTS processed_webhook_events (
+            event_id     TEXT PRIMARY KEY,
+            event_type   TEXT NOT NULL,
+            processed_at TEXT NOT NULL
+        )
+        """,
+        # Subscription health columns — ADD COLUMN IF NOT EXISTS is idempotent in PG 9.6+
+        "ALTER TABLE credits ADD COLUMN IF NOT EXISTS payment_failed_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE credits ADD COLUMN IF NOT EXISTS subscription_status TEXT NOT NULL DEFAULT 'active'",
+        # ── Auth tables (Phase 1) ─────────────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS accounts (
+            id          TEXT PRIMARY KEY,
+            email       TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            last_login  TEXT,
+            CONSTRAINT accounts_email_uniq UNIQUE (email)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS magic_link_tokens (
+            token       TEXT PRIMARY KEY,
+            account_id  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            used_at     TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token       TEXT PRIMARY KEY,
+            account_id  TEXT NOT NULL,
+            device_id   TEXT,
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            last_used   TEXT
+        )
+        """,
+        # Nullable account_id on existing tables — completely additive, zero downtime
+        "ALTER TABLE credits          ADD COLUMN IF NOT EXISTS account_id TEXT",
+        "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS account_id TEXT",
+        "ALTER TABLE preferences      ADD COLUMN IF NOT EXISTS account_id TEXT",
+        "ALTER TABLE stripe_customers ADD COLUMN IF NOT EXISTS account_id TEXT",
+        "ALTER TABLE founding_members ADD COLUMN IF NOT EXISTS account_id TEXT",
+        # Indexes for fast auth lookups
+        "CREATE INDEX IF NOT EXISTS accounts_email_idx    ON accounts(email)",
+        "CREATE INDEX IF NOT EXISTS mlt_account_idx        ON magic_link_tokens(account_id)",
+        "CREATE INDEX IF NOT EXISTS auth_sessions_acct_idx ON auth_sessions(account_id)",
+        # ── Auth (Phase 2) — email-change token support ───────────────────────
+        "ALTER TABLE magic_link_tokens ADD COLUMN IF NOT EXISTS token_type TEXT NOT NULL DEFAULT 'sign_in'",
+        "ALTER TABLE magic_link_tokens ADD COLUMN IF NOT EXISTS new_email TEXT",
     ]
     try:
         with engine.connect() as conn:
@@ -477,17 +641,122 @@ if engine is not None:
         logger.error(f"❌ DATABASE_URL connection failed — session persistence disabled: {e}")
 reset_expired_credits()
 
+# ========================
+# WEBHOOK HELPER FUNCTIONS
+# ========================
+
+def _lookup_user_id(customer_id: str):
+    """Return the internal user_id for a Stripe customer_id, or None."""
+    if engine is None or not customer_id:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT user_id FROM stripe_customers WHERE customer_id=:cid"),
+                {"cid": customer_id}
+            ).fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"_lookup_user_id error: {e}")
+        return None
+
+
+def _is_duplicate_event(event_id: str) -> bool:
+    """Return True if this Stripe event_id has already been successfully processed."""
+    if engine is None:
+        return False
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT 1 FROM processed_webhook_events WHERE event_id=:eid"),
+                {"eid": event_id}
+            ).fetchone()
+        return row is not None
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"_is_duplicate_event error: {e}")
+        return False
+
+
+def _mark_event_processed(event_id: str, event_type: str) -> None:
+    """Record that a Stripe event was handled (idempotency journal)."""
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO processed_webhook_events (event_id, event_type, processed_at)
+                VALUES (:eid, :etype, :now)
+                ON CONFLICT (event_id) DO NOTHING
+            """), {"eid": event_id, "etype": event_type, "now": datetime.utcnow().isoformat()})
+            conn.commit()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"_mark_event_processed error: {e}")
+
+
 @app.get("/")
 async def root():
     return {"status": "CerebroEcho Backend Live", "version": "1.2.0"}
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok", 
-        "groq_configured": client is not None,
-        "api_key_present": bool(os.getenv("GROQ_API_KEY"))
-    }
+    """
+    Readiness probe — intentionally not rate-limited so monitoring services
+    can poll freely. Returns 200 when all critical dependencies are healthy,
+    503 when any critical dependency is degraded.
+
+    Critical (affect HTTP status): db, groq, deepgram
+    Non-critical (informational only): openai, cartesia, stripe, resend, perplexity
+    """
+    checks: dict = {}
+
+    # ── Database (real connectivity check) ────────────────────────────────
+    db_ok = False
+    if engine is not None:
+        try:
+            t0 = time.time()
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            checks["db_latency_ms"] = round((time.time() - t0) * 1000, 1)
+            db_ok = True
+        except Exception as e:
+            checks["db_error"] = str(e)[:160]
+    else:
+        checks["db_error"] = "engine not initialised — DATABASE_URL missing?"
+
+    # ── SDK clients (initialised at startup) ─────────────────────────────
+    groq_ok     = client is not None
+    deepgram_ok = deepgram_client is not None
+    # TTS is available when either Cartesia or OpenAI is initialised
+    tts_ok      = cartesia_client is not None or openai_client is not None
+
+    # ── API key presence (never expose values) ────────────────────────────
+    checks.update({
+        "db":          db_ok,
+        "groq":        groq_ok,
+        "deepgram":    deepgram_ok,
+        "tts":         tts_ok,
+        "cartesia":    cartesia_client is not None,
+        "openai":      openai_client is not None,
+        "stripe":      bool(os.getenv("STRIPE_SECRET_KEY")),
+        "resend":      bool(os.getenv("RESEND_API_KEY")),
+        "perplexity":  bool(os.getenv("PERPLEXITY_API_KEY")),
+    })
+
+    healthy = db_ok and groq_ok and deepgram_ok
+    uptime_s = round(time.time() - _START_TIME)
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "status":         "ok" if healthy else "degraded",
+            "checks":         checks,
+            "version":        "1.2.0",
+            "uptime_seconds": uptime_s,
+            "ts":             datetime.utcnow().isoformat() + "Z",
+        },
+    )
 
 @app.get("/founder_spots")
 async def get_founder_spots():
@@ -502,6 +771,7 @@ async def get_founder_spots():
     return {"remaining": max(0, 50 - count), "claimed": count}
 
 @app.post("/transcribe")
+@limiter.limit(RATE_TRANSCRIBE)
 async def transcribe(request: Request):
     if deepgram_client is None:
         raise HTTPException(status_code=503, detail="Transcription service unavailable: DEEPGRAM_API_KEY not set")
@@ -525,7 +795,9 @@ async def transcribe(request: Request):
 
 
 @app.post("/coach")
+@limiter.limit(RATE_COACH)
 async def coach(
+    request: Request,
     transcript: str = Form(None),
     audio: UploadFile = File(None),
     file: UploadFile = File(None),
@@ -707,6 +979,7 @@ async def coach(
     except HTTPException:
         raise
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         logger.error(f"❌ /coach ERROR: {e}")
         import traceback
         logger.error(traceback.format_exc())
@@ -716,7 +989,9 @@ async def coach(
 
 
 @app.post("/process_audio")
+@limiter.limit(RATE_TRANSCRIBE)
 async def process_audio(
+    request: Request,
     audio: UploadFile = File(None),
     file: UploadFile = File(None),
     deviceId: str = Form(...),
@@ -833,18 +1108,21 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
         }
         
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         logger.error(f"❌ ERROR: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
-        
+
         # Cleanup on error
         if temp_filename and os.path.exists(temp_filename):
             os.unlink(temp_filename)
-        
+
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 @app.post("/process_and_speak")
+@limiter.limit(RATE_TRANSCRIBE)
 async def process_and_speak(
+    request: Request,
     audio: UploadFile = File(None),
     file: UploadFile = File(None),
     deviceId: str = Form(...),
@@ -955,7 +1233,8 @@ Provide a 2-3 sentence tactical answer. Be concise and confident."""
 
 
 @app.post("/tts")
-async def text_to_speech(data: dict):
+@limiter.limit(RATE_TTS)
+async def text_to_speech(request: Request, data: dict):
     text = data.get("text", "").strip()
     logger.info(f"📢 TTS received ({len(text)} chars): {text[:100]}...")
     if not text:
@@ -999,6 +1278,7 @@ async def text_to_speech(data: dict):
 
             return StreamingResponse(cartesia_stream(), media_type="audio/mpeg")
         except Exception as e:
+            sentry_sdk.capture_exception(e)
             import traceback
             logger.error(f"Cartesia failed: {traceback.format_exc()}")
 
@@ -1022,6 +1302,7 @@ async def text_to_speech(data: dict):
 
         return StreamingResponse(generate(), media_type="audio/mpeg")
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         import traceback
         logger.error(f"TTS error: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
@@ -1047,7 +1328,8 @@ async def session_start(data: dict):
 
 
 @app.post("/session/end")
-async def session_end(data: dict):
+@limiter.limit(RATE_SESSION_END)
+async def session_end(request: Request, data: dict):
     device_id = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
     history = data.get("history", [])
@@ -1097,7 +1379,9 @@ Session transcript:
 
 
 @app.post("/quick_transcribe")
+@limiter.limit(RATE_TRANSCRIBE)
 async def quick_transcribe(
+    request: Request,
     audio: UploadFile = File(None),
     file: UploadFile = File(None),
 ):
@@ -1137,7 +1421,9 @@ async def quick_transcribe(
 # ========================
 
 @app.post("/upload-context")
+@limiter.limit(RATE_UPLOAD)
 async def upload_context(
+    request: Request,
     file: UploadFile = File(...),
     deviceId: str = Form(""),
 ):
@@ -1183,7 +1469,8 @@ async def upload_context(
 # ========================
 
 @app.post("/brief")
-async def brief_url(data: dict):
+@limiter.limit(RATE_BRIEF)
+async def brief_url(request: Request, data: dict):
     url = data.get("url", "").strip()
     device_id = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
@@ -1229,6 +1516,7 @@ async def brief_url(data: dict):
         resp.raise_for_status()
         brief_text = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         logger.error(f"Perplexity API error: {e}")
         raise HTTPException(status_code=500, detail=f"Briefing failed: {str(e)}")
 
@@ -1257,16 +1545,24 @@ async def brief_url(data: dict):
 # ========================
 
 @app.get("/preferences")
-async def get_preferences(deviceId: str, userEmail: str = "anonymous"):
+async def get_preferences(request: Request, deviceId: str, userEmail: str = "anonymous"):
     if engine is None:
         return {"preference_text": ""}
-    user_id = f"{deviceId}_{userEmail}"
+    user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
     try:
         with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT preference_text FROM preferences WHERE user_id=:uid"),
-                {"uid": user_id}
-            ).fetchone()
+            if account_id:
+                row = conn.execute(text("""
+                    SELECT preference_text FROM preferences
+                    WHERE account_id = :aid OR user_id = :uid
+                    ORDER BY (CASE WHEN account_id = :aid THEN 0 ELSE 1 END)
+                    LIMIT 1
+                """), {"aid": account_id, "uid": user_id}).fetchone()
+            else:
+                row = conn.execute(
+                    text("SELECT preference_text FROM preferences WHERE user_id=:uid"),
+                    {"uid": user_id}
+                ).fetchone()
         return {"preference_text": row[0] if row else ""}
     except Exception as e:
         logger.error(f"get_preferences error: {e}")
@@ -1274,7 +1570,7 @@ async def get_preferences(deviceId: str, userEmail: str = "anonymous"):
 
 
 @app.post("/preferences")
-async def save_preferences(data: dict):
+async def save_preferences(request: Request, data: dict):
     device_id = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
     preference_text = data.get("preference_text", "")
@@ -1282,16 +1578,17 @@ async def save_preferences(data: dict):
     if engine is None:
         return {"status": "skipped"}
 
-    user_id = f"{device_id}_{user_email}"
+    user_id, account_id, _ = _resolve_user(request, device_id, user_email)
     try:
         with engine.connect() as conn:
             conn.execute(text("""
-                INSERT INTO preferences (user_id, preference_text, updated_at)
-                VALUES (:uid, :text, :now)
+                INSERT INTO preferences (user_id, preference_text, updated_at, account_id)
+                VALUES (:uid, :text, :now, :aid)
                 ON CONFLICT (user_id) DO UPDATE SET
                     preference_text = EXCLUDED.preference_text,
-                    updated_at = EXCLUDED.updated_at
-            """), {"uid": user_id, "text": preference_text, "now": datetime.utcnow().isoformat()})
+                    updated_at = EXCLUDED.updated_at,
+                    account_id = COALESCE(preferences.account_id, EXCLUDED.account_id)
+            """), {"uid": user_id, "text": preference_text, "now": datetime.utcnow().isoformat(), "aid": account_id})
             conn.commit()
         logger.info(f"⚙️ Preferences saved for {user_id}")
         return {"status": "saved"}
@@ -1305,7 +1602,8 @@ async def save_preferences(data: dict):
 # ========================
 
 @app.post("/end-session")
-async def end_session(data: dict):
+@limiter.limit(RATE_SESSION_END)
+async def end_session(request: Request, data: dict):
     session_id = data.get("session_id", "")
     device_id  = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
@@ -1378,38 +1676,84 @@ async def end_session(data: dict):
 
 
 @app.get("/session-memory")
-async def get_session_memory(deviceId: str, userEmail: str = "anonymous"):
+@limiter.limit(RATE_READS)
+async def get_session_memory(request: Request, deviceId: str, userEmail: str = "anonymous"):
     if engine is None:
         return {"summaries": []}
-    user_id = f"{deviceId}_{userEmail}"
+    user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT summary FROM session_history
-                WHERE user_id = :uid AND summary IS NOT NULL AND summary != ''
-                ORDER BY timestamp DESC
-                LIMIT 3
-            """), {"uid": user_id}).fetchall()
+            if account_id:
+                rows = conn.execute(text("""
+                    SELECT summary FROM session_history
+                    WHERE (account_id = :aid OR user_id = :uid)
+                    AND summary IS NOT NULL AND summary != ''
+                    ORDER BY timestamp DESC LIMIT 3
+                """), {"aid": account_id, "uid": user_id}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT summary FROM session_history
+                    WHERE user_id = :uid AND summary IS NOT NULL AND summary != ''
+                    ORDER BY timestamp DESC LIMIT 3
+                """), {"uid": user_id}).fetchall()
         return {"summaries": [r[0] for r in rows]}
     except Exception as e:
         logger.error(f"session-memory error: {e}")
         return {"summaries": []}
 
 
-@app.get("/session-history")
-async def get_session_history(deviceId: str, userEmail: str = "anonymous"):
+@app.post("/session-memory/clear")
+@limiter.limit(RATE_READS)
+async def clear_session_memory(request: Request, data: dict):
+    """Nullify all session summaries for the user. History rows are kept; only the summary text is wiped."""
+    device_id  = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
     if engine is None:
-        return {"sessions": []}
-    user_id = f"{deviceId}_{userEmail}"
+        return {"status": "skipped", "cleared": 0}
+    user_id, account_id, _ = _resolve_user(request, device_id, user_email)
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
-                FROM session_history
-                WHERE user_id = :uid
-                ORDER BY timestamp DESC
-                LIMIT 50
-            """), {"uid": user_id}).fetchall()
+            if account_id:
+                result = conn.execute(text("""
+                    UPDATE session_history SET summary = NULL
+                    WHERE (account_id = :aid OR user_id = :uid)
+                    AND summary IS NOT NULL
+                """), {"aid": account_id, "uid": user_id})
+            else:
+                result = conn.execute(text("""
+                    UPDATE session_history SET summary = NULL
+                    WHERE user_id = :uid AND summary IS NOT NULL
+                """), {"uid": user_id})
+            conn.commit()
+            cleared = result.rowcount
+        logger.info(f"🗑️  Session memory cleared for {user_id[:24]}… ({cleared} rows)")
+        return {"status": "cleared", "cleared": cleared}
+    except Exception as e:
+        logger.error(f"clear_session_memory error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to clear session memory.")
+
+
+@app.get("/session-history")
+@limiter.limit(RATE_READS)
+async def get_session_history(request: Request, deviceId: str, userEmail: str = "anonymous"):
+    if engine is None:
+        return {"sessions": []}
+    user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+    try:
+        with engine.connect() as conn:
+            if account_id:
+                rows = conn.execute(text("""
+                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                    FROM session_history
+                    WHERE account_id = :aid OR user_id = :uid
+                    ORDER BY timestamp DESC LIMIT 50
+                """), {"aid": account_id, "uid": user_id}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                    FROM session_history WHERE user_id = :uid
+                    ORDER BY timestamp DESC LIMIT 50
+                """), {"uid": user_id}).fetchall()
         sessions = [
             {
                 "session_id": r[0],
@@ -1429,26 +1773,239 @@ async def get_session_history(deviceId: str, userEmail: str = "anonymous"):
 
 
 @app.get("/credits")
-async def get_credits(deviceId: str, userEmail: str = "anonymous"):
-    user_id = f"{deviceId}_{userEmail}"
-    data = _get_credit_balance(user_id)
+@limiter.limit(RATE_READS)
+async def get_credits(request: Request, deviceId: str, userEmail: str = "anonymous"):
+    user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+
+    # Account-level lookup when authenticated (cross-device: find the most-credited row)
+    credit_data = None
+    if account_id and engine is not None:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT balance, plan_type, total_used FROM credits
+                    WHERE account_id = :aid ORDER BY balance DESC LIMIT 1
+                """), {"aid": account_id}).fetchone()
+            if row:
+                credit_data = {"balance": row[0], "plan_type": row[1], "total_used": row[2]}
+        except Exception as e:
+            logger.error(f"credits account lookup error: {e}")
+
+    if credit_data is None:
+        credit_data = _get_credit_balance(user_id)
+
     is_founding = False
     if engine is not None:
         try:
             with engine.connect() as conn:
-                row = conn.execute(
-                    text("SELECT 1 FROM founding_members WHERE user_id=:uid"),
-                    {"uid": user_id}
-                ).fetchone()
+                if account_id:
+                    row = conn.execute(
+                        text("SELECT 1 FROM founding_members WHERE account_id = :aid OR user_id = :uid LIMIT 1"),
+                        {"aid": account_id, "uid": user_id}
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        text("SELECT 1 FROM founding_members WHERE user_id=:uid"),
+                        {"uid": user_id}
+                    ).fetchone()
                 is_founding = row is not None
         except Exception as e:
             logger.error(f"founding check error: {e}")
     return {
-        "balance": data["balance"],
-        "plan_type": data["plan_type"],
-        "total_used": data["total_used"],
+        "balance": credit_data["balance"],
+        "plan_type": credit_data["plan_type"],
+        "total_used": credit_data["total_used"],
         "is_founding_member": is_founding,
     }
+
+
+def _payment_method_label(pm) -> str | None:
+    """Human-readable payment method line for billing UI (best-effort)."""
+    if not pm:
+        return None
+    try:
+        ptype = pm.get("type") if isinstance(pm, dict) else getattr(pm, "type", None)
+        if ptype == "card":
+            card = pm.get("card") if isinstance(pm, dict) else pm.card
+            if not card:
+                return "Card on file"
+            brand = (card.get("brand") if isinstance(card, dict) else getattr(card, "brand", None)) or "Card"
+            last4 = card.get("last4") if isinstance(card, dict) else getattr(card, "last4", None)
+            if last4:
+                return f"{str(brand).title()} ···· {last4}"
+            return f"{str(brand).title()} card"
+    except Exception:
+        pass
+    return "Payment method on file"
+
+
+@app.get("/billing-summary")
+@limiter.limit(RATE_READS)
+async def billing_summary(request: Request, deviceId: str, userEmail: str = "anonymous"):
+    """Plan/credits from PostgreSQL plus an optional live Stripe snapshot (subscription dates, PM, recent invoices)."""
+    user_id, account_id, _resolved = _resolve_user(request, deviceId, userEmail)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    out = {
+        "balance": 0,
+        "plan_type": "free",
+        "total_used": 0,
+        "subscription_status": "active",
+        "credits_reset_date": None,
+        "included_credits_per_cycle": PLAN_CREDITS["free"],
+        "is_founding_member": False,
+        "stripe_customer": False,
+        "stripe_current_period_end": None,
+        "stripe_cancel_at_period_end": None,
+        "stripe_subscription_status": None,
+        "payment_method_summary": None,
+        "invoices": [],
+        "stripe_sync_error": None,
+    }
+
+    customer_id = None
+    row = None
+    try:
+        with engine.connect() as conn:
+            if account_id:
+                row = conn.execute(
+                    text("""
+                        SELECT balance, plan_type, total_used, reset_date, subscription_status
+                        FROM credits WHERE account_id = :aid ORDER BY balance DESC LIMIT 1
+                    """),
+                    {"aid": account_id},
+                ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    text("""
+                        SELECT balance, plan_type, total_used, reset_date, subscription_status
+                        FROM credits WHERE user_id = :uid
+                    """),
+                    {"uid": user_id},
+                ).fetchone()
+            if row:
+                out["balance"] = int(row[0])
+                out["plan_type"] = row[1] or "free"
+                out["total_used"] = int(row[2] or 0)
+                out["credits_reset_date"] = row[3]
+                out["subscription_status"] = (row[4] or "active").strip() or "active"
+                out["included_credits_per_cycle"] = int(PLAN_CREDITS.get(out["plan_type"], PLAN_CREDITS["free"]))
+
+            if account_id:
+                r2 = conn.execute(
+                    text("""
+                        SELECT customer_id FROM stripe_customers
+                        WHERE account_id = :aid OR user_id = :uid LIMIT 1
+                    """),
+                    {"aid": account_id, "uid": user_id},
+                ).fetchone()
+            else:
+                r2 = conn.execute(
+                    text("SELECT customer_id FROM stripe_customers WHERE user_id = :uid LIMIT 1"),
+                    {"uid": user_id},
+                ).fetchone()
+            if r2 and r2[0]:
+                customer_id = r2[0]
+
+            if account_id:
+                fm = conn.execute(
+                    text("SELECT 1 FROM founding_members WHERE account_id = :aid OR user_id = :uid LIMIT 1"),
+                    {"aid": account_id, "uid": user_id},
+                ).fetchone()
+            else:
+                fm = conn.execute(
+                    text("SELECT 1 FROM founding_members WHERE user_id = :uid LIMIT 1"),
+                    {"uid": user_id},
+                ).fetchone()
+            out["is_founding_member"] = fm is not None
+    except Exception as e:
+        logger.error(f"billing-summary DB error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+    if row is None:
+        fb = _get_credit_balance(user_id)
+        out["balance"] = int(fb.get("balance", 0))
+        out["plan_type"] = fb.get("plan_type") or "free"
+        out["total_used"] = int(fb.get("total_used") or 0)
+        out["included_credits_per_cycle"] = int(PLAN_CREDITS.get(out["plan_type"], PLAN_CREDITS["free"]))
+        try:
+            with engine.connect() as conn:
+                r3 = conn.execute(
+                    text("SELECT reset_date, subscription_status FROM credits WHERE user_id = :uid"),
+                    {"uid": user_id},
+                ).fetchone()
+                if r3:
+                    out["credits_reset_date"] = r3[0]
+                    out["subscription_status"] = (r3[1] or "active").strip() or "active"
+        except Exception as e2:
+            logger.warning(f"billing-summary credits fallback: {e2}")
+
+    if not customer_id:
+        return out
+
+    out["stripe_customer"] = True
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY")
+    if not stripe_key:
+        out["stripe_sync_error"] = "stripe_not_configured"
+        return out
+
+    stripe.api_key = stripe_key
+    try:
+        cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
+        dpm = None
+        try:
+            invset = cust.get("invoice_settings") if isinstance(cust, dict) else cust.invoice_settings
+            if invset:
+                dpm = invset.get("default_payment_method") if isinstance(invset, dict) else invset.default_payment_method
+        except Exception:
+            dpm = None
+        if isinstance(dpm, str) and dpm:
+            dpm = stripe.PaymentMethod.retrieve(dpm)
+        if dpm:
+            out["payment_method_summary"] = _payment_method_label(dpm)
+
+        subs = stripe.Subscription.list(customer=customer_id, limit=10, status="all")
+        active = None
+        for s in subs.data:
+            if s.status in ("active", "trialing", "past_due"):
+                active = s
+                break
+        if active:
+            out["stripe_current_period_end"] = int(active.current_period_end)
+            out["stripe_cancel_at_period_end"] = bool(getattr(active, "cancel_at_period_end", False))
+            out["stripe_subscription_status"] = active.status
+            pm_sub = active.get("default_payment_method") if isinstance(active, dict) else getattr(active, "default_payment_method", None)
+            if pm_sub:
+                if isinstance(pm_sub, str):
+                    pm_sub = stripe.PaymentMethod.retrieve(pm_sub)
+                out["payment_method_summary"] = out["payment_method_summary"] or _payment_method_label(pm_sub)
+
+        invs = stripe.Invoice.list(customer=customer_id, limit=8)
+        lines = []
+        for inv in invs.data:
+            url = inv.get("hosted_invoice_url") if isinstance(inv, dict) else getattr(inv, "hosted_invoice_url", None)
+            if not url:
+                continue
+            created = inv.get("created") if isinstance(inv, dict) else inv.created
+            total = inv.get("total") if isinstance(inv, dict) else inv.total
+            cur = (inv.get("currency") if isinstance(inv, dict) else inv.currency) or "usd"
+            inv_id = inv.get("id") if isinstance(inv, dict) else inv.id
+            status = inv.get("status") if isinstance(inv, dict) else inv.status
+            lines.append({
+                "id": inv_id,
+                "created": int(created) if created is not None else None,
+                "total": int(total) if total is not None else None,
+                "currency": str(cur).lower(),
+                "status": status,
+                "hosted_invoice_url": url,
+            })
+        out["invoices"] = lines
+    except Exception as e:
+        logger.warning(f"billing-summary Stripe error: {e}")
+        out["stripe_sync_error"] = str(e)[:240]
+
+    return out
 
 
 STRIPE_PRICE_IDS = {
@@ -1479,8 +2036,331 @@ SUMMARY_ALLOWED_PLANS = {"command", "operator", "founding_50"}
 # Custom role/persona requires Operator
 OPERATOR_ONLY_OPTIONS = {"Custom"}
 
+@app.post("/billing-portal")
+@limiter.limit(RATE_CHECKOUT)
+async def billing_portal(request: Request, data: dict):
+    """Create a Stripe Customer Portal session for self-serve subscription management."""
+    device_id  = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY")
+    if not stripe_key:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    stripe.api_key = stripe_key
+    user_id, account_id, _ = _resolve_user(request, device_id, user_email)
+
+    # Look up the Stripe customer ID — prefer account_id match for cross-device access
+    try:
+        with engine.connect() as conn:
+            if account_id:
+                row = conn.execute(
+                    text("SELECT customer_id FROM stripe_customers WHERE account_id = :aid OR user_id = :uid LIMIT 1"),
+                    {"aid": account_id, "uid": user_id}
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    text("SELECT customer_id FROM stripe_customers WHERE user_id=:uid"),
+                    {"uid": user_id}
+                ).fetchone()
+    except Exception as e:
+        logger.error(f"billing-portal DB lookup error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+    if not row:
+        raise HTTPException(status_code=404, detail={
+            "code": "NO_SUBSCRIPTION",
+            "message": "No active subscription found for this account. If you recently subscribed and see this message, contact support@cerebroecho.com.",
+        })
+
+    customer_id = row[0]
+    try:
+        portal_session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url="https://cerebroecho.com/app",
+        )
+        logger.info(f"🔗 Billing portal session created for user {user_id[:24]}…")
+        return {"url": portal_session.url}
+    except stripe.StripeError as e:
+        logger.error(f"Stripe billing portal error: {e}")
+        raise HTTPException(status_code=500, detail=f"Billing portal error: {str(e)}")
+
+
+RATE_EXPORT  = os.environ.get("RATE_LIMIT_EXPORT",  "5/minute")
+RATE_DELETE  = os.environ.get("RATE_LIMIT_DELETE",  "3/hour")
+
+@app.get("/export-data")
+@limiter.limit(RATE_EXPORT)
+async def export_data(request: Request, deviceId: str, userEmail: str = "anonymous"):
+    """Export all personal data for the requesting user as a downloadable JSON file."""
+    user_id, account_id, resolved_email = _resolve_user(request, deviceId, userEmail)
+
+    # Unauthenticated requests still require a registered email to identify records
+    if not account_id:
+        if not userEmail or userEmail.strip().lower() in ("anonymous", "") or "@" not in userEmail:
+            raise HTTPException(
+                status_code=400,
+                detail="A registered email address is required to export data. Sign in or save your email in the app first.",
+            )
+
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    export_email = resolved_email if account_id else userEmail
+    payload: dict = {
+        "export_metadata": {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "app": "CerebroEcho",
+            "schema_version": "2",
+        },
+        "identity": {
+            "email": export_email,
+            "device_id": deviceId,
+            "authenticated": account_id is not None,
+        },
+        "account": None,
+        "preferences": None,
+        "sessions": [],
+        "founding_member": None,
+    }
+
+    try:
+        with engine.connect() as conn:
+            if account_id:
+                row = conn.execute(text("""
+                    SELECT balance, plan_type, total_used, reset_date, subscription_status
+                    FROM credits WHERE account_id = :aid OR user_id = :uid LIMIT 1
+                """), {"aid": account_id, "uid": user_id}).fetchone()
+            else:
+                row = conn.execute(text("""
+                    SELECT balance, plan_type, total_used, reset_date, subscription_status
+                    FROM credits WHERE user_id = :uid
+                """), {"uid": user_id}).fetchone()
+            if row:
+                payload["account"] = {
+                    "plan": row[1],
+                    "credits_remaining": row[0],
+                    "credits_used_total": row[2],
+                    "credits_reset_date": row[3],
+                    "subscription_status": row[4],
+                }
+
+            if account_id:
+                row = conn.execute(text("""
+                    SELECT preference_text, updated_at FROM preferences
+                    WHERE account_id = :aid OR user_id = :uid LIMIT 1
+                """), {"aid": account_id, "uid": user_id}).fetchone()
+            else:
+                row = conn.execute(text("""
+                    SELECT preference_text, updated_at FROM preferences WHERE user_id = :uid
+                """), {"uid": user_id}).fetchone()
+            if row:
+                payload["preferences"] = {
+                    "text": row[0],
+                    "last_updated": row[1],
+                }
+
+            if account_id:
+                rows = conn.execute(text("""
+                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                    FROM session_history WHERE account_id = :aid OR user_id = :uid
+                    ORDER BY timestamp DESC
+                """), {"aid": account_id, "uid": user_id}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                    FROM session_history WHERE user_id = :uid
+                    ORDER BY timestamp DESC
+                """), {"uid": user_id}).fetchall()
+            payload["sessions"] = [
+                {
+                    "session_id": r[0],
+                    "role": r[1],
+                    "persona": r[2],
+                    "style": r[3],
+                    "summary": r[4],
+                    "timestamp": r[5],
+                    "duration_seconds": r[6],
+                }
+                for r in rows
+            ]
+
+            if account_id:
+                row = conn.execute(text("""
+                    SELECT purchase_date FROM founding_members WHERE account_id = :aid OR user_id = :uid LIMIT 1
+                """), {"aid": account_id, "uid": user_id}).fetchone()
+            else:
+                row = conn.execute(text("""
+                    SELECT purchase_date FROM founding_members WHERE user_id = :uid
+                """), {"uid": user_id}).fetchone()
+            if row:
+                payload["founding_member"] = {"purchase_date": row[0]}
+
+    except Exception as e:
+        logger.error(f"export-data error for {user_id[:24]}…: {e}")
+        raise HTTPException(status_code=500, detail="Export failed. Please try again.")
+
+    logger.info(f"📦 Data export for {user_id[:24]}… ({len(payload['sessions'])} sessions)")
+    filename = f"cerebroecho-export-{datetime.utcnow().strftime('%Y%m%d')}.json"
+    return Response(
+        content=json.dumps(payload, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/account/delete")
+@limiter.limit(RATE_DELETE)
+async def delete_account(request: Request, data: dict):
+    """
+    Self-serve account deletion.
+
+    Deleted:   credits, session_history, preferences, stripe_customers (routing row),
+               auth_sessions, magic_link_tokens, accounts record,
+               legacy sessions table rows, in-memory usage_tracker entry.
+    Retained:  founding_members (financial audit trail for $299 payment),
+               processed_webhook_events (Stripe idempotency guard — safe to keep forever).
+    Stripe:    active/past_due subscriptions are cancelled immediately before DB deletion.
+               The Stripe Customer object itself is NOT deleted (needed for dispute/refund history).
+    Auth:      When authenticated via Bearer token, device_id is optional — account_id
+               covers all devices. Unauthenticated requests still require device_id.
+    """
+    device_id     = data.get("deviceId", "")
+    user_email    = data.get("userEmail", "")
+    confirm_email = data.get("confirmEmail", "")
+
+    user_id, account_id, resolved_email = _resolve_user(request, device_id, user_email)
+    check_email = resolved_email if account_id else user_email
+
+    if not check_email or check_email.strip().lower() in ("anonymous", "") or "@" not in check_email:
+        raise HTTPException(status_code=400, detail="A registered email address is required to delete an account.")
+    if check_email.strip().lower() != confirm_email.strip().lower():
+        raise HTTPException(status_code=400, detail="Email confirmation does not match. Please type your email exactly.")
+    if not account_id and not device_id:
+        raise HTTPException(status_code=400, detail="Device ID is required.")
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # Verify the account exists before doing anything destructive
+    try:
+        with engine.connect() as conn:
+            if account_id:
+                exists = conn.execute(
+                    text("SELECT 1 FROM accounts WHERE id = :aid"),
+                    {"aid": account_id}
+                ).fetchone()
+                if not exists:
+                    exists = conn.execute(
+                        text("SELECT 1 FROM credits WHERE user_id = :uid"),
+                        {"uid": user_id}
+                    ).fetchone()
+            else:
+                exists = conn.execute(
+                    text("SELECT 1 FROM credits WHERE user_id = :uid"),
+                    {"uid": user_id}
+                ).fetchone()
+    except Exception as e:
+        logger.error(f"delete_account: existence check failed for {user_id[:24]}…: {e}")
+        raise HTTPException(status_code=500, detail="Database error. Please try again.")
+
+    if not exists:
+        # Treat unknown accounts as already deleted — avoids user enumeration
+        logger.warning(f"⚠️ delete_account: no account found for {user_id[:24]}… — treating as already deleted")
+        return {"status": "deleted", "stripe_cancelled": False}
+
+    # ── Cancel active Stripe subscriptions ────────────────────────────────
+    stripe_cancelled = False
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY")
+    if stripe_key:
+        stripe.api_key = stripe_key
+        try:
+            with engine.connect() as conn:
+                if account_id:
+                    sc_row = conn.execute(
+                        text("SELECT customer_id FROM stripe_customers WHERE account_id = :aid OR user_id = :uid LIMIT 1"),
+                        {"aid": account_id, "uid": user_id}
+                    ).fetchone()
+                else:
+                    sc_row = conn.execute(
+                        text("SELECT customer_id FROM stripe_customers WHERE user_id = :uid"),
+                        {"uid": user_id}
+                    ).fetchone()
+            if sc_row:
+                customer_id = sc_row[0]
+                for sub_status in ("active", "past_due"):
+                    subs = stripe.Subscription.list(customer=customer_id, status=sub_status, limit=10)
+                    for sub in subs.auto_paging_iter():
+                        stripe.Subscription.cancel(sub.id)
+                        logger.info(
+                            f"🚫 Stripe subscription {sub.id} cancelled "
+                            f"(account deletion | user={user_id[:24]}…)"
+                        )
+                        stripe_cancelled = True
+        except stripe.StripeError as e:
+            logger.error(f"❌ delete_account: Stripe cancellation error for {user_id[:24]}…: {e}")
+            # Non-fatal — DB deletion proceeds; webhook will eventually sync
+        except Exception as e:
+            logger.error(f"❌ delete_account: unexpected Stripe step error for {user_id[:24]}…: {e}")
+    else:
+        logger.warning("⚠️ delete_account: STRIPE_SECRET_KEY not set — skipping subscription cancellation")
+
+    # ── Wipe database records ──────────────────────────────────────────────
+    try:
+        with engine.connect() as conn:
+            if account_id:
+                n_sessions = conn.execute(
+                    text("DELETE FROM session_history WHERE account_id = :aid OR user_id = :uid"),
+                    {"aid": account_id, "uid": user_id}
+                ).rowcount
+                conn.execute(text("DELETE FROM preferences WHERE account_id = :aid OR user_id = :uid"),     {"aid": account_id, "uid": user_id})
+                conn.execute(text("DELETE FROM credits WHERE account_id = :aid OR user_id = :uid"),          {"aid": account_id, "uid": user_id})
+                conn.execute(text("DELETE FROM stripe_customers WHERE account_id = :aid OR user_id = :uid"), {"aid": account_id, "uid": user_id})
+                conn.execute(text("DELETE FROM auth_sessions WHERE account_id = :aid"),                      {"aid": account_id})
+                conn.execute(text("DELETE FROM magic_link_tokens WHERE account_id = :aid"),                  {"aid": account_id})
+                conn.execute(text("DELETE FROM accounts WHERE id = :aid"),                                   {"aid": account_id})
+                if device_id:
+                    conn.execute(
+                        text("DELETE FROM sessions WHERE device_id = :did AND user_email = :email"),
+                        {"did": device_id, "email": check_email}
+                    )
+            else:
+                n_sessions = conn.execute(
+                    text("DELETE FROM session_history WHERE user_id = :uid"),
+                    {"uid": user_id}
+                ).rowcount
+                conn.execute(text("DELETE FROM preferences WHERE user_id = :uid"),     {"uid": user_id})
+                conn.execute(text("DELETE FROM credits WHERE user_id = :uid"),          {"uid": user_id})
+                conn.execute(text("DELETE FROM stripe_customers WHERE user_id = :uid"), {"uid": user_id})
+                conn.execute(
+                    text("DELETE FROM sessions WHERE device_id = :did AND user_email = :email"),
+                    {"did": device_id, "email": user_email}
+                )
+            conn.commit()
+        logger.info(
+            f"🗑️ Account deleted | user={user_id[:24]}… | "
+            f"sessions_removed={n_sessions} | stripe_cancelled={stripe_cancelled}"
+        )
+    except Exception as e:
+        logger.error(f"❌ delete_account: DB deletion failed for {user_id[:24]}…: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Deletion failed. Please contact support@cerebroecho.com if this persists."
+        )
+
+    # ── Clear in-memory rate-limiter state ────────────────────────────────
+    usage_tracker.pop(user_id, None)
+    if device_id:
+        usage_tracker.pop(f"{device_id}_anonymous", None)
+
+    return {"status": "deleted", "stripe_cancelled": stripe_cancelled}
+
+
 @app.post("/create-checkout")
-async def create_checkout(data: dict):
+@limiter.limit(RATE_CHECKOUT)
+async def create_checkout(request: Request, data: dict):
     plan       = data.get("plan")
     device_id  = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
@@ -1532,8 +2412,8 @@ async def create_checkout(data: dict):
 
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
-    payload    = await request.body()
-    sig_header = request.headers.get("stripe-signature")
+    payload        = await request.body()
+    sig_header     = request.headers.get("stripe-signature")
     webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
     if not webhook_secret:
@@ -1544,81 +2424,515 @@ async def stripe_webhook(request: Request):
     except stripe.errors.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    event_type   = event["type"]
-    session_data = event["data"]["object"]
+    event_id   = event["id"]
+    event_type = event["type"]
+    obj        = event["data"]["object"]
 
-    if event_type == "checkout.session.completed":
-        user_id    = session_data.get("metadata", {}).get("user_id", "")
-        plan       = session_data.get("metadata", {}).get("plan", "unknown")
-        customer_id = session_data.get("customer", "")
-        payment_id  = session_data.get("payment_intent") or session_data.get("id", "")
+    # ── Idempotency: Stripe retries on non-2xx; skip already-processed events ──
+    if _is_duplicate_event(event_id):
+        logger.info(f"🔁 Duplicate webhook {event_id} ({event_type}) — already processed, skipping")
+        return {"received": True}
 
-        if user_id and plan in PLAN_CREDITS and engine is not None:
-            new_balance = PLAN_CREDITS[plan]
-            reset_date  = (datetime.utcnow() + timedelta(days=30)).isoformat() if plan != "free" else None
-            try:
-                with engine.connect() as conn:
-                    # Update credits / plan
-                    conn.execute(text("""
-                        INSERT INTO credits (user_id, balance, plan_type, total_used, reset_date)
-                        VALUES (:uid, :bal, :plan, 0, :reset)
-                        ON CONFLICT (user_id) DO UPDATE SET
-                            balance    = :bal,
-                            plan_type  = :plan,
-                            total_used = 0,
-                            reset_date = :reset
-                    """), {"uid": user_id, "bal": new_balance, "plan": plan, "reset": reset_date})
+    logger.info(f"📨 Stripe webhook: {event_type} | id={event_id}")
 
-                    # Store customer_id → user_id mapping for subscription events
-                    if customer_id:
+    try:
+        # ── checkout.session.completed ────────────────────────────────────────
+        if event_type == "checkout.session.completed":
+            user_id     = obj.get("metadata", {}).get("user_id", "")
+            plan        = obj.get("metadata", {}).get("plan", "")
+            customer_id = obj.get("customer", "")
+            payment_id  = obj.get("payment_intent") or obj.get("id", "")
+
+            if not user_id or plan not in PLAN_CREDITS:
+                logger.warning(f"⚠️ checkout.session.completed: missing user_id or unknown plan='{plan}' — skipping")
+            elif engine is None:
+                logger.error("❌ checkout.session.completed: no DB engine")
+            else:
+                new_balance = PLAN_CREDITS[plan]
+                reset_date  = (datetime.utcnow() + timedelta(days=30)).isoformat() if plan != "free" else None
+                try:
+                    with engine.connect() as conn:
                         conn.execute(text("""
-                            INSERT INTO stripe_customers (customer_id, user_id, created_at)
-                            VALUES (:cid, :uid, :now)
-                            ON CONFLICT (customer_id) DO NOTHING
-                        """), {"cid": customer_id, "uid": user_id, "now": datetime.utcnow().isoformat()})
+                            INSERT INTO credits
+                                (user_id, balance, plan_type, total_used, reset_date,
+                                 payment_failed_count, subscription_status)
+                            VALUES (:uid, :bal, :plan, 0, :reset, 0, 'active')
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                balance              = :bal,
+                                plan_type            = :plan,
+                                total_used           = 0,
+                                reset_date           = :reset,
+                                payment_failed_count = 0,
+                                subscription_status  = 'active'
+                        """), {"uid": user_id, "bal": new_balance, "plan": plan, "reset": reset_date})
 
-                    # Record founding member
-                    if plan == "founding_50":
+                        if customer_id:
+                            conn.execute(text("""
+                                INSERT INTO stripe_customers (customer_id, user_id, created_at)
+                                VALUES (:cid, :uid, :now)
+                                ON CONFLICT (customer_id) DO NOTHING
+                            """), {"cid": customer_id, "uid": user_id, "now": datetime.utcnow().isoformat()})
+
+                        if plan == "founding_50":
+                            conn.execute(text("""
+                                INSERT INTO founding_members (user_id, purchase_date, stripe_payment_id)
+                                VALUES (:uid, :date, :pid)
+                                ON CONFLICT (user_id) DO NOTHING
+                            """), {"uid": user_id, "date": datetime.utcnow().isoformat(), "pid": payment_id})
+
+                        conn.commit()
+                    logger.info(f"✅ checkout.session.completed: user={user_id} plan={plan} balance={new_balance} customer={customer_id}")
+                    to_email = user_id.split("_", 1)[1] if "_" in user_id else ""
+                    email_service.send_upgrade_email(to_email, plan, new_balance)
+                except Exception as e:
+                    logger.error(f"❌ checkout.session.completed DB error: {e}")
+
+        # ── invoice.paid (monthly renewal) ────────────────────────────────────
+        # Stripe fires this for every successful invoice, including the initial one.
+        # We only reset credits on subscription_cycle to avoid racing checkout.session.completed.
+        elif event_type == "invoice.paid":
+            customer_id    = obj.get("customer", "")
+            billing_reason = obj.get("billing_reason", "")
+            amount_paid    = obj.get("amount_paid", 0)
+
+            if billing_reason not in ("subscription_cycle", "subscription_update"):
+                logger.info(f"📨 invoice.paid: billing_reason={billing_reason!r} — not a renewal, skipping")
+            else:
+                uid = _lookup_user_id(customer_id)
+                if not uid:
+                    logger.warning(f"⚠️ invoice.paid: no user mapping for customer {customer_id}")
+                elif engine is not None:
+                    creds = _get_credit_balance(uid)
+                    plan  = creds["plan_type"]
+                    if plan in PLAN_CREDITS and plan != "free":
+                        new_balance = PLAN_CREDITS[plan]
+                        new_reset   = (datetime.utcnow() + timedelta(days=30)).isoformat()
+                        try:
+                            with engine.connect() as conn:
+                                conn.execute(text("""
+                                    UPDATE credits SET
+                                        balance              = :bal,
+                                        reset_date           = :reset,
+                                        total_used           = 0,
+                                        payment_failed_count = 0,
+                                        subscription_status  = 'active'
+                                    WHERE user_id = :uid
+                                """), {"bal": new_balance, "reset": new_reset, "uid": uid})
+                                conn.commit()
+                            logger.info(
+                                f"✅ invoice.paid (renewal): user={uid} plan={plan} "
+                                f"balance={new_balance} billing_reason={billing_reason} "
+                                f"amount_paid={amount_paid}"
+                            )
+                        except Exception as e:
+                            logger.error(f"❌ invoice.paid DB error: {e}")
+
+        # ── invoice.payment_failed ─────────────────────────────────────────────
+        elif event_type == "invoice.payment_failed":
+            customer_id   = obj.get("customer", "")
+            attempt_count = obj.get("attempt_count", 1)
+            next_attempt  = obj.get("next_payment_attempt")
+            amount_due    = obj.get("amount_due", 0)
+
+            uid = _lookup_user_id(customer_id)
+            if not uid:
+                logger.warning(f"⚠️ invoice.payment_failed: no user mapping for customer {customer_id}")
+            elif engine is not None:
+                max_failures = int(os.environ.get("MAX_PAYMENT_FAILURES", "3"))
+                try:
+                    with engine.connect() as conn:
+                        # Increment failure count and set status
                         conn.execute(text("""
-                            INSERT INTO founding_members (user_id, purchase_date, stripe_payment_id)
-                            VALUES (:uid, :date, :pid)
-                            ON CONFLICT (user_id) DO NOTHING
-                        """), {"uid": user_id, "date": datetime.utcnow().isoformat(), "pid": payment_id})
+                            UPDATE credits SET
+                                payment_failed_count = payment_failed_count + 1,
+                                subscription_status  = CASE
+                                    WHEN payment_failed_count + 1 >= :max THEN 'grace_expired'
+                                    ELSE 'past_due'
+                                END
+                            WHERE user_id = :uid
+                        """), {"uid": uid, "max": max_failures})
 
-                    conn.commit()
-                logger.info(f"✅ checkout.session.completed: user={user_id} plan={plan} balance={new_balance}")
-            except Exception as e:
-                logger.error(f"webhook DB error: {e}")
+                        # Check if grace period exceeded → downgrade
+                        row = conn.execute(
+                            text("SELECT payment_failed_count, plan_type FROM credits WHERE user_id=:uid"),
+                            {"uid": uid}
+                        ).fetchone()
+                        fail_count  = row[0] if row else 0
+                        failed_plan = row[1] if row else "unknown"
 
-    elif event_type == "customer.subscription.deleted":
-        # Downgrade to free when subscription is cancelled
-        customer_id = session_data.get("customer", "")
-        if customer_id and engine is not None:
-            try:
-                with engine.connect() as conn:
-                    row = conn.execute(
-                        text("SELECT user_id FROM stripe_customers WHERE customer_id=:cid"),
-                        {"cid": customer_id}
-                    ).fetchone()
-                    if row:
-                        uid = row[0]
+                        if fail_count >= max_failures:
+                            conn.execute(text("""
+                                UPDATE credits SET
+                                    plan_type = 'free', balance = 0, reset_date = NULL
+                                WHERE user_id = :uid
+                            """), {"uid": uid})
+                            logger.warning(
+                                f"🚫 invoice.payment_failed: grace period exceeded — "
+                                f"downgraded {uid} (was {failed_plan}) after {fail_count} failures"
+                            )
+                        conn.commit()
+
+                    next_str = (
+                        datetime.utcfromtimestamp(next_attempt).isoformat()
+                        if next_attempt else "no further retries"
+                    )
+                    logger.warning(
+                        f"⚠️ invoice.payment_failed: customer={customer_id} user={uid} "
+                        f"attempt={attempt_count} failures_total={fail_count} "
+                        f"next_retry={next_str} amount_due={amount_due}"
+                    )
+                    to_email = uid.split("_", 1)[1] if "_" in uid else ""
+                    email_service.send_payment_failed_email(to_email, attempt_count, next_str, amount_due)
+                except Exception as e:
+                    logger.error(f"❌ invoice.payment_failed DB error: {e}")
+
+        # ── customer.subscription.updated ─────────────────────────────────────
+        # Fires on: plan change via portal, cancel-at-period-end toggle,
+        # status transitions (active → past_due → unpaid → canceled), trial end.
+        elif event_type == "customer.subscription.updated":
+            customer_id          = obj.get("customer", "")
+            status               = obj.get("status", "")
+            cancel_at_period_end = obj.get("cancel_at_period_end", False)
+            items                = obj.get("items", {}).get("data", [])
+            new_price_id         = items[0]["price"]["id"] if items else None
+
+            uid = _lookup_user_id(customer_id)
+            if not uid:
+                logger.warning(f"⚠️ subscription.updated: no user mapping for customer {customer_id}")
+            elif engine is not None:
+                # Reverse-map price_id → plan name for portal-initiated plan changes
+                price_to_plan = {v: k for k, v in STRIPE_PRICE_IDS.items() if v}
+                new_plan = price_to_plan.get(new_price_id) if new_price_id else None
+
+                if status in ("active", "trialing"):
+                    try:
+                        with engine.connect() as conn:
+                            row = conn.execute(
+                                text("SELECT plan_type FROM credits WHERE user_id=:uid"),
+                                {"uid": uid}
+                            ).fetchone()
+                            current_plan = row[0] if row else None
+
+                            if new_plan and new_plan in PLAN_CREDITS and current_plan != new_plan:
+                                # Plan changed via Customer Portal — update plan_type immediately.
+                                # Balance is NOT reset here; invoice.paid handles the next cycle.
+                                conn.execute(text("""
+                                    UPDATE credits SET
+                                        plan_type            = :plan,
+                                        payment_failed_count = 0,
+                                        subscription_status  = 'active'
+                                    WHERE user_id = :uid
+                                """), {"plan": new_plan, "uid": uid})
+                                logger.info(
+                                    f"✅ subscription.updated: plan change "
+                                    f"{current_plan} → {new_plan} for {uid}"
+                                )
+                            else:
+                                # Same plan or unknown price — just clear any failure state
+                                conn.execute(text("""
+                                    UPDATE credits SET
+                                        payment_failed_count = 0,
+                                        subscription_status  = 'active'
+                                    WHERE user_id = :uid
+                                """), {"uid": uid})
+                                if cancel_at_period_end:
+                                    logger.info(f"📨 subscription.updated: {uid} will cancel at period end — no immediate downgrade")
+                                else:
+                                    logger.info(f"📨 subscription.updated: {uid} status=active, no plan change")
+                            conn.commit()
+                    except Exception as e:
+                        logger.error(f"❌ subscription.updated (active) DB error: {e}")
+
+                elif status == "past_due":
+                    try:
+                        with engine.connect() as conn:
+                            conn.execute(text("""
+                                UPDATE credits SET subscription_status = 'past_due'
+                                WHERE user_id = :uid
+                            """), {"uid": uid})
+                            conn.commit()
+                        logger.warning(f"⚠️ subscription.updated: {uid} is past_due")
+                    except Exception as e:
+                        logger.error(f"❌ subscription.updated (past_due) DB error: {e}")
+
+                elif status in ("canceled", "incomplete_expired", "unpaid"):
+                    try:
+                        with engine.connect() as conn:
+                            conn.execute(text("""
+                                UPDATE credits SET
+                                    plan_type           = 'free',
+                                    balance             = 0,
+                                    reset_date          = NULL,
+                                    subscription_status = 'canceled'
+                                WHERE user_id = :uid
+                            """), {"uid": uid})
+                            conn.commit()
+                        logger.info(f"🚫 subscription.updated: status={status} — downgraded {uid} to free")
+                    except Exception as e:
+                        logger.error(f"❌ subscription.updated (canceled/unpaid) DB error: {e}")
+
+                else:
+                    logger.info(f"📨 subscription.updated: unhandled status={status!r} for {uid}")
+
+        # ── customer.subscription.deleted ─────────────────────────────────────
+        # Fires when a subscription fully ends (cancel_at_period_end reached,
+        # or immediate cancellation). Always means access should end.
+        elif event_type == "customer.subscription.deleted":
+            customer_id = obj.get("customer", "")
+            ended_at    = obj.get("ended_at")
+
+            uid = _lookup_user_id(customer_id)
+            if not uid:
+                logger.warning(f"⚠️ subscription.deleted: no user mapping for customer {customer_id}")
+            elif engine is not None:
+                try:
+                    with engine.connect() as conn:
                         conn.execute(text("""
-                            UPDATE credits
-                            SET plan_type='free', balance=0, reset_date=NULL
-                            WHERE user_id=:uid
+                            UPDATE credits SET
+                                plan_type            = 'free',
+                                balance              = 0,
+                                reset_date           = NULL,
+                                payment_failed_count = 0,
+                                subscription_status  = 'canceled'
+                            WHERE user_id = :uid
                         """), {"uid": uid})
                         conn.commit()
-                        logger.info(f"🚫 Subscription cancelled — downgraded {uid} to free")
-                    else:
-                        logger.warning(f"🚫 Subscription cancelled for unknown customer {customer_id}")
-            except Exception as e:
-                logger.error(f"subscription.deleted DB error: {e}")
+                    ended_str = (
+                        datetime.utcfromtimestamp(ended_at).isoformat()
+                        if ended_at else "unknown"
+                    )
+                    logger.info(f"🚫 subscription.deleted: downgraded {uid} to free | ended_at={ended_str}")
+                    to_email = uid.split("_", 1)[1] if "_" in uid else ""
+                    email_service.send_cancellation_email(to_email, ended_str)
+                except Exception as e:
+                    logger.error(f"❌ subscription.deleted DB error: {e}")
 
-    elif event_type == "invoice.payment_failed":
-        customer_id = session_data.get("customer", "")
-        logger.warning(f"⚠️ Payment failed for customer {customer_id}")
+        else:
+            logger.info(f"📨 Unhandled Stripe event type: {event_type!r}")
 
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"❌ Unhandled webhook exception ({event_type} | {event_id}): {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # Still mark processed to prevent infinite retries on bugs.
+        # Remove this line if you want Stripe to retry on unexpected exceptions.
+
+    _mark_event_processed(event_id, event_type)
     return {"received": True}
+
+
+# ========================
+# AUTH HELPERS
+# ========================
+
+def _create_account_or_get(email: str) -> str:
+    """Get or create an account by email. Returns account_id (TEXT UUID)."""
+    clean = email.lower().strip()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT id FROM accounts WHERE email = :email"),
+                {"email": clean}
+            ).fetchone()
+            if row:
+                return row[0]
+            account_id = str(_uuid.uuid4())
+            conn.execute(text("""
+                INSERT INTO accounts (id, email, created_at)
+                VALUES (:id, :email, :now)
+                ON CONFLICT (email) DO NOTHING
+            """), {"id": account_id, "email": clean, "now": datetime.utcnow().isoformat()})
+            conn.commit()
+        # Re-fetch on a fresh connection — handles race where two requests created simultaneously
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT id FROM accounts WHERE email = :email"),
+                {"email": clean}
+            ).fetchone()
+            result = row[0] if row else account_id
+        logger.info(f"👤 Account ready: {result[:8]}… ({clean})")
+        return result
+    except Exception as e:
+        logger.error(f"_create_account_or_get error: {e}")
+        raise
+
+
+def _create_magic_link(account_id: str) -> str:
+    """Invalidate unused tokens for this account and issue a fresh one."""
+    token      = _secrets.token_urlsafe(32)
+    expires_at = (datetime.utcnow() + timedelta(minutes=MAGIC_LINK_EXPIRY_MINUTES)).isoformat()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                DELETE FROM magic_link_tokens WHERE account_id = :aid AND used_at IS NULL
+            """), {"aid": account_id})
+            conn.execute(text("""
+                INSERT INTO magic_link_tokens (token, account_id, expires_at)
+                VALUES (:token, :aid, :expires)
+            """), {"token": token, "aid": account_id, "expires": expires_at})
+            conn.commit()
+    except Exception as e:
+        logger.error(f"_create_magic_link error: {e}")
+        raise
+    return token
+
+
+def _verify_magic_link(token: str):
+    """Consume a magic link token. Returns account_id or None."""
+    now = datetime.utcnow().isoformat()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT account_id, expires_at, used_at
+                FROM magic_link_tokens WHERE token = :token
+            """), {"token": token}).fetchone()
+            if not row:
+                return None
+            account_id, expires_at, used_at = row[0], row[1], row[2]
+            if used_at or expires_at < now:
+                return None
+            conn.execute(text("""
+                UPDATE magic_link_tokens SET used_at = :now WHERE token = :token
+            """), {"now": now, "token": token})
+            conn.commit()
+        return account_id
+    except Exception as e:
+        logger.error(f"_verify_magic_link error: {e}")
+        return None
+
+
+def _create_auth_session(account_id: str, device_id: str = "") -> str:
+    """Create a rolling 30-day session. Returns the session token."""
+    token      = _secrets.token_urlsafe(32)
+    now        = datetime.utcnow()
+    expires_at = (now + timedelta(days=SESSION_EXPIRY_DAYS)).isoformat()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO auth_sessions
+                    (token, account_id, device_id, created_at, expires_at, last_used)
+                VALUES (:token, :aid, :did, :now, :expires, :now)
+            """), {
+                "token": token, "aid": account_id, "did": device_id,
+                "now": now.isoformat(), "expires": expires_at,
+            })
+            conn.execute(text("""
+                UPDATE accounts SET last_login = :now WHERE id = :aid
+            """), {"now": now.isoformat(), "aid": account_id})
+            conn.commit()
+    except Exception as e:
+        logger.error(f"_create_auth_session error: {e}")
+        raise
+    return token
+
+
+def _get_account_from_session(session_token: str):
+    """Validate session token. Returns (account_id, email) or (None, None)."""
+    if engine is None or not session_token:
+        return None, None
+    now = datetime.utcnow().isoformat()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT s.account_id, a.email
+                FROM auth_sessions s
+                JOIN accounts a ON s.account_id = a.id
+                WHERE s.token = :token AND s.expires_at > :now
+            """), {"token": session_token, "now": now}).fetchone()
+            if not row:
+                return None, None
+            conn.execute(text("""
+                UPDATE auth_sessions SET last_used = :now WHERE token = :token
+            """), {"now": now, "token": session_token})
+            conn.commit()
+        return row[0], row[1]
+    except Exception as e:
+        logger.error(f"_get_account_from_session error: {e}")
+        return None, None
+
+
+def _backfill_account_id(account_id: str, email: str, device_id: str = "") -> None:
+    """Set account_id on existing device-keyed rows for a newly verified account.
+
+    Matches rows by email suffix (covers all past device IDs for this email) and
+    optionally by the current device's anonymous key.
+    Uses RIGHT() instead of LIKE to avoid _ wildcard issues in email addresses.
+    Also renames the current device's anonymous user_id to the email-keyed form
+    (credits + preferences only) so composite-key lookups stay consistent.
+    """
+    if engine is None:
+        return
+    email_suffix = f"_{email}"
+    suffix_len   = len(email_suffix)
+    params: dict = {"aid": account_id, "slen": suffix_len, "suffix": email_suffix}
+    anon_clause  = ""
+    if device_id:
+        params["anon_key"] = f"{device_id}_anonymous"
+        anon_clause = "OR user_id = :anon_key"
+    try:
+        with engine.connect() as conn:
+            for tbl in ("credits", "session_history", "preferences", "founding_members"):
+                n = conn.execute(text(f"""
+                    UPDATE {tbl} SET account_id = :aid
+                    WHERE account_id IS NULL
+                    AND (RIGHT(user_id, :slen) = :suffix {anon_clause})
+                """), params).rowcount
+                if n:
+                    logger.info(f"↗ backfill {tbl}: {n} row(s) → account {account_id[:8]}…")
+            n = conn.execute(text(f"""
+                UPDATE stripe_customers SET account_id = :aid
+                WHERE account_id IS NULL
+                AND (RIGHT(user_id, :slen) = :suffix {anon_clause})
+            """), params).rowcount
+            if n:
+                logger.info(f"↗ backfill stripe_customers: {n} row(s) → account {account_id[:8]}…")
+            conn.commit()
+        # Rename anonymous user_id → email-keyed user_id for this device (best-effort)
+        # Only for credits and preferences since those are the PK-keyed lookup tables.
+        if device_id:
+            anon_key  = f"{device_id}_anonymous"
+            email_key = f"{device_id}_{email}"
+            try:
+                with engine.connect() as conn:
+                    for tbl in ("credits", "preferences"):
+                        existing = conn.execute(
+                            text(f"SELECT 1 FROM {tbl} WHERE user_id = :ek LIMIT 1"),
+                            {"ek": email_key}
+                        ).fetchone()
+                        if not existing:
+                            n = conn.execute(text(f"""
+                                UPDATE {tbl} SET user_id = :ek WHERE user_id = :ak
+                            """), {"ek": email_key, "ak": anon_key}).rowcount
+                            if n:
+                                logger.info(f"↗ rename {tbl} user_id: anon→email for device {device_id[:8]}…")
+                    conn.commit()
+            except Exception as rename_err:
+                logger.warning(f"_backfill_account_id: user_id rename skipped: {rename_err}")
+    except Exception as e:
+        logger.error(f"_backfill_account_id error: {e}")
+        sentry_sdk.capture_exception(e)
+
+
+def _resolve_user(request: Request, device_id: str = "", user_email: str = "anonymous"):
+    """Dual-mode identity resolution.
+
+    Checks Authorization: Bearer header first. If the session is valid, returns
+    the account email (verified) paired with the provided device_id, along with
+    the account_id UUID. Falls back to the composite device+email key when no
+    valid token is present.
+
+    Returns: (user_id: str, account_id: str | None, email: str)
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            account_id, email = _get_account_from_session(token)
+            if account_id and email:
+                uid = f"{device_id}_{email}" if device_id else email
+                return uid, account_id, email
+    return f"{device_id}_{user_email}", None, user_email
 
 
 @app.post("/save_email")
@@ -1633,7 +2947,323 @@ async def save_email(data: dict):
         del usage_tracker[old_key]
     
     logger.info(f"📧 Email saved: {email}")
+    email_service.send_welcome_email(email)
     return {"status": "success", "message": "Trial extended to 10 questions"}
+
+# ========================
+# AUTH ENDPOINTS
+# ========================
+
+@app.post("/auth/request-link")
+@limiter.limit(RATE_AUTH_REQUEST)
+async def auth_request_link(request: Request, data: dict):
+    """Send a magic sign-in link. Creates account if new. Always returns 200 to avoid email enumeration."""
+    email     = (data.get("email") or "").strip().lower()
+    device_id = data.get("deviceId", "")
+
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    try:
+        account_id = _create_account_or_get(email)
+        token      = _create_magic_link(account_id)
+        magic_url  = f"{APP_BASE_URL}?magic_token={token}"
+        email_service.send_magic_link_email(email, magic_url)
+        logger.info(f"🔗 Magic link sent to {email}")
+    except Exception as e:
+        logger.error(f"auth_request_link error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send sign-in link. Please try again.")
+
+    return {"status": "sent"}
+
+
+@app.post("/auth/verify-link")
+@limiter.limit(RATE_AUTH_VERIFY)
+async def auth_verify_link(request: Request, data: dict):
+    """Consume a magic link token and return a session token."""
+    token     = (data.get("token") or "").strip()
+    device_id = data.get("deviceId", "")
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Token required.")
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    account_id = _verify_magic_link(token)
+    if not account_id:
+        raise HTTPException(status_code=401, detail={
+            "code": "INVALID_OR_EXPIRED_TOKEN",
+            "message": "This link has expired or already been used. Request a new one.",
+        })
+
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT email FROM accounts WHERE id = :id"),
+                {"id": account_id}
+            ).fetchone()
+        email = row[0] if row else ""
+    except Exception as e:
+        logger.error(f"auth_verify_link: email lookup error: {e}")
+        email = ""
+
+    session_token = _create_auth_session(account_id, device_id)
+    _backfill_account_id(account_id, email, device_id)
+
+    logger.info(f"✅ Auth session created: account={account_id[:8]}… device={device_id[:8] if device_id else 'none'}")
+    return {
+        "session_token": session_token,
+        "account_id":    account_id,
+        "email":         email,
+    }
+
+
+@app.get("/auth/session")
+@limiter.limit("60/minute")
+async def auth_get_session(request: Request):
+    """Validate a session token and return account info."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <token> required.")
+    session_token = auth_header[7:].strip()
+    account_id, email = _get_account_from_session(session_token)
+    if not account_id:
+        raise HTTPException(status_code=401, detail={
+            "code": "SESSION_EXPIRED",
+            "message": "Session expired. Please sign in again.",
+        })
+    return {"account_id": account_id, "email": email}
+
+
+@app.post("/auth/sign-out")
+@limiter.limit("30/minute")
+async def auth_sign_out(request: Request):
+    """Invalidate the current session token."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return {"status": "signed_out"}
+    token = auth_header[7:].strip()
+    if token and engine is not None:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("DELETE FROM auth_sessions WHERE token = :token"), {"token": token})
+                conn.commit()
+        except Exception as e:
+            logger.error(f"auth_sign_out error: {e}")
+    return {"status": "signed_out"}
+
+
+@app.get("/auth/sessions")
+@limiter.limit("30/minute")
+async def auth_list_sessions(request: Request):
+    """Return active sessions for the authenticated account."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <token> required.")
+    session_token = auth_header[7:].strip()
+    account_id, email = _get_account_from_session(session_token)
+    if not account_id:
+        raise HTTPException(status_code=401, detail={
+            "code": "SESSION_EXPIRED",
+            "message": "Session expired. Please sign in again.",
+        })
+    if engine is None:
+        return {"sessions": []}
+    now = datetime.utcnow().isoformat()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT device_id, created_at, last_used,
+                       CASE WHEN token = :cur THEN true ELSE false END AS is_current
+                FROM auth_sessions
+                WHERE account_id = :aid AND expires_at > :now
+                ORDER BY last_used DESC NULLS LAST
+                LIMIT 20
+            """), {"aid": account_id, "now": now, "cur": session_token}).fetchall()
+        sessions = [
+            {
+                "device_id":  (r[0] or "")[:12] or None,
+                "created_at": r[1],
+                "last_used":  r[2],
+                "is_current": bool(r[3]),
+            }
+            for r in rows
+        ]
+        return {"sessions": sessions}
+    except Exception as e:
+        logger.error(f"auth_list_sessions error: {e}")
+        return {"sessions": []}
+
+
+@app.post("/auth/sign-out-all")
+@limiter.limit("10/minute")
+async def auth_sign_out_all(request: Request):
+    """Revoke all active sessions for the authenticated account."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <token> required.")
+    token = auth_header[7:].strip()
+    account_id, email = _get_account_from_session(token)
+    if not account_id:
+        raise HTTPException(status_code=401, detail={
+            "code": "SESSION_EXPIRED",
+            "message": "Session expired. Please sign in again.",
+        })
+    if engine is None:
+        return {"status": "signed_out", "sessions_revoked": 0}
+    try:
+        with engine.connect() as conn:
+            deleted = conn.execute(
+                text("DELETE FROM auth_sessions WHERE account_id = :aid"),
+                {"aid": account_id}
+            ).rowcount
+            conn.commit()
+        logger.info(f"🔓 sign-out-all: {deleted} session(s) revoked for account {account_id[:8]}…")
+        return {"status": "signed_out", "sessions_revoked": deleted}
+    except Exception as e:
+        logger.error(f"auth_sign_out_all error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to sign out. Please try again.")
+
+
+@app.post("/auth/request-email-change")
+@limiter.limit(RATE_AUTH_REQUEST)
+async def auth_request_email_change(request: Request, data: dict):
+    """Request an email address change. Sends a verification link to the new address."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Must be signed in to change email.")
+    token = auth_header[7:].strip()
+    account_id, current_email = _get_account_from_session(token)
+    if not account_id:
+        raise HTTPException(status_code=401, detail={
+            "code": "SESSION_EXPIRED",
+            "message": "Session expired. Sign in again.",
+        })
+
+    new_email = (data.get("new_email") or "").strip().lower()
+    if not new_email or "@" not in new_email or "." not in new_email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
+    if new_email == (current_email or "").strip().lower():
+        raise HTTPException(status_code=400, detail="New email must be different from your current email.")
+
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    try:
+        with engine.connect() as conn:
+            existing = conn.execute(
+                text("SELECT id FROM accounts WHERE email = :email"),
+                {"email": new_email}
+            ).fetchone()
+        if existing and existing[0] != account_id:
+            raise HTTPException(status_code=409, detail="That email is already associated with another CerebroEcho account.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"auth_request_email_change: conflict check error: {e}")
+        raise HTTPException(status_code=500, detail="Database error. Please try again.")
+
+    change_token = _secrets.token_urlsafe(32)
+    expires_at   = (datetime.utcnow() + timedelta(minutes=MAGIC_LINK_EXPIRY_MINUTES)).isoformat()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                DELETE FROM magic_link_tokens
+                WHERE account_id = :aid AND token_type = 'email_change' AND used_at IS NULL
+            """), {"aid": account_id})
+            conn.execute(text("""
+                INSERT INTO magic_link_tokens (token, account_id, expires_at, token_type, new_email)
+                VALUES (:token, :aid, :expires, 'email_change', :new_email)
+            """), {"token": change_token, "aid": account_id, "expires": expires_at, "new_email": new_email})
+            conn.commit()
+    except Exception as e:
+        logger.error(f"auth_request_email_change: token creation error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send change link. Please try again.")
+
+    change_url = f"{APP_BASE_URL}?email_change_token={change_token}"
+    email_service.send_email_change_request(current_email or "", new_email, change_url)
+    email_service.send_email_change_notification(current_email or "", new_email)
+
+    logger.info(f"📧 Email change requested: account {account_id[:8]}… → {new_email}")
+    return {"status": "sent", "new_email": new_email}
+
+
+@app.post("/auth/verify-email-change")
+@limiter.limit(RATE_AUTH_VERIFY)
+async def auth_verify_email_change(request: Request, data: dict):
+    """Consume an email-change token and update the account email."""
+    token     = (data.get("token") or "").strip()
+    device_id = data.get("deviceId", "")
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Token required.")
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    now = datetime.utcnow().isoformat()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT account_id, expires_at, used_at, new_email
+                FROM magic_link_tokens
+                WHERE token = :token AND token_type = 'email_change'
+            """), {"token": token}).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=401, detail={
+                "code": "INVALID_OR_EXPIRED_TOKEN",
+                "message": "This link has expired or already been used.",
+            })
+
+        account_id, expires_at, used_at, new_email = row
+        if used_at or expires_at < now:
+            raise HTTPException(status_code=401, detail={
+                "code": "INVALID_OR_EXPIRED_TOKEN",
+                "message": "This link has expired or already been used.",
+            })
+        if not new_email:
+            raise HTTPException(status_code=500, detail="Invalid email change token — missing target address.")
+
+        with engine.connect() as conn:
+            acc_row = conn.execute(
+                text("SELECT email FROM accounts WHERE id = :id"),
+                {"id": account_id}
+            ).fetchone()
+        old_email = acc_row[0] if acc_row else ""
+
+        with engine.connect() as conn:
+            conn.execute(
+                text("UPDATE magic_link_tokens SET used_at = :now WHERE token = :token"),
+                {"now": now, "token": token}
+            )
+            conn.execute(
+                text("UPDATE accounts SET email = :email WHERE id = :aid"),
+                {"email": new_email, "aid": account_id}
+            )
+            conn.commit()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"auth_verify_email_change error: {e}")
+        raise HTTPException(status_code=500, detail="Email change failed. Please try again.")
+
+    session_token = _create_auth_session(account_id, device_id)
+
+    try:
+        email_service.send_email_changed_confirmation(new_email, old_email)
+    except Exception:
+        pass  # non-fatal
+
+    logger.info(f"✅ Email changed: account {account_id[:8]}… → {new_email}")
+    return {
+        "status":        "changed",
+        "session_token": session_token,
+        "email":         new_email,
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
