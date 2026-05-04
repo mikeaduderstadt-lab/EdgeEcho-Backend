@@ -2459,13 +2459,16 @@ async def create_checkout(request: Request, data: dict):
         metadata = {"plan": plan, "user_id": user_id}
         if account_id:
             metadata["account_id"] = account_id
-        session = stripe.checkout.Session.create(
-            mode=mode,
-            line_items=[{"price": price_id, "quantity": 1}],
-            metadata=metadata,
-            success_url="https://cerebroecho.com/app?payment=success",
-            cancel_url="https://cerebroecho.com/app?payment=cancelled",
-        )
+        session_kwargs: dict = {
+            "mode":         mode,
+            "line_items":   [{"price": price_id, "quantity": 1}],
+            "metadata":     metadata,
+            "success_url":  "https://cerebroecho.com/app?payment=success",
+            "cancel_url":   "https://cerebroecho.com/app?payment=cancelled",
+        }
+        if user_email and user_email != "anonymous" and "@" in user_email:
+            session_kwargs["customer_email"] = user_email
+        session = stripe.checkout.Session.create(**session_kwargs)
         return {"url": session.url}
     except stripe.StripeError as e:
         logger.error(f"Stripe error: {e}")
@@ -2506,6 +2509,16 @@ async def stripe_webhook(request: Request):
             account_id  = meta.get("account_id") or None
             customer_id = obj.get("customer", "")
             payment_id  = obj.get("payment_intent") or obj.get("id", "")
+
+            # Email fallback: anonymous landing-page checkout → resolve by Stripe email
+            if not user_id and engine is not None:
+                stripe_email = ((obj.get("customer_details") or {}).get("email") or "").lower().strip()
+                if stripe_email:
+                    account_id = _create_account_or_get(stripe_email)
+                    user_id = _get_credits_user_id(f"account_{account_id}", account_id)
+                    if not user_id:
+                        user_id = f"account_{account_id}"
+                    logger.info(f"📧 checkout: resolved by Stripe email → account={account_id[:8]}…")
 
             if not user_id or plan not in PLAN_CREDITS:
                 logger.warning(f"⚠️ checkout.session.completed: missing user_id or unknown plan='{plan}' — skipping")
