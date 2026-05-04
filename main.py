@@ -2964,7 +2964,10 @@ async def auth_request_link(request: Request, data: dict):
     if not email or "@" not in email or "." not in email.split("@")[-1]:
         raise HTTPException(status_code=400, detail="A valid email address is required.")
     if engine is None:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+        raise HTTPException(status_code=503, detail={
+            "code": "SERVICE_UNAVAILABLE",
+            "message": "Sign-in is temporarily unavailable. Please try again in a moment.",
+        })
 
     try:
         account_id = _create_account_or_get(email)
@@ -2974,7 +2977,10 @@ async def auth_request_link(request: Request, data: dict):
         logger.info(f"🔗 Magic link sent to {email}")
     except Exception as e:
         logger.error(f"auth_request_link error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to send sign-in link. Please try again.")
+        raise HTTPException(status_code=500, detail={
+            "code": "SEND_FAILED",
+            "message": "Failed to send sign-in link. Please try again.",
+        })
 
     return {"status": "sent"}
 
@@ -2989,7 +2995,10 @@ async def auth_verify_link(request: Request, data: dict):
     if not token:
         raise HTTPException(status_code=400, detail="Token required.")
     if engine is None:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+        raise HTTPException(status_code=503, detail={
+            "code": "SERVICE_UNAVAILABLE",
+            "message": "Sign-in is temporarily unavailable. Please try again in a moment.",
+        })
 
     account_id = _verify_magic_link(token)
     if not account_id:
