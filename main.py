@@ -89,7 +89,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://cerebroecho.com", "https://www.cerebroecho.com", "https://cerebroecho-frontend.vercel.app"],
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization", "Accept"],
     expose_headers=["X-Transcript", "X-Answer", "X-Questions-Used"],
 )
 
