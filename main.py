@@ -1518,21 +1518,38 @@ async def upload_context(
 
 
 # ========================
-# URL BRIEFING (PERPLEXITY)
+# URL BRIEFING (JINA + GROQ)
+# Jina+Groq is now primary briefing engine.
+# PERPLEXITY_API_KEY reserved for future use.
 # ========================
+
+BRIEFING_TIER_CREDITS = {
+    "quick_read": 2,
+    "deep_brief": 8,
+    "war_room":   20,
+}
+
 
 @app.post("/brief")
 @limiter.limit(RATE_BRIEF)
 async def brief_url(request: Request, data: dict):
-    url = data.get("url", "").strip()
-    device_id = data.get("deviceId", "")
+    url        = data.get("url", "").strip()
+    device_id  = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
+    role       = (data.get("role", "")    or "General").strip()
+    persona    = (data.get("persona", "") or "Analyst").strip()
+    tier       = (data.get("tier", "deep_brief") or "deep_brief").strip()
+
+    if tier not in BRIEFING_TIER_CREDITS:
+        tier = "deep_brief"
+
+    credits_cost = BRIEFING_TIER_CREDITS[tier]
 
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
     # Plan gate: Command+ only
-    user_id = f"{device_id}_{user_email}"
+    user_id   = f"{device_id}_{user_email}"
     plan_info = _get_credit_balance(user_id)
     if plan_info["plan_type"] not in BRIEFING_ALLOWED_PLANS:
         raise HTTPException(status_code=403, detail={
@@ -1541,56 +1558,122 @@ async def brief_url(request: Request, data: dict):
             "required_plan": "command",
         })
 
-    perplexity_key = os.environ.get("PERPLEXITY_API_KEY")
-    if not perplexity_key:
-        raise HTTPException(status_code=503, detail="Briefing service unavailable: PERPLEXITY_API_KEY not set")
+    # Step 1 — Fetch page content via Jina Reader (no API key required)
+    jina_content = None
+    fallback_used = False
+    try:
+        import httpx as _httpx
+        jina_resp = _httpx.get(
+            f"https://r.jina.ai/{url}",
+            headers={"Accept": "text/plain"},
+            follow_redirects=True,
+            timeout=20.0,
+        )
+        if jina_resp.status_code == 200 and jina_resp.text.strip():
+            jina_content = jina_resp.text[:12000]
+    except Exception as e:
+        logger.warning(f"Jina fetch failed for {url}: {e}")
 
-    prompt = (
-        f"Research the following URL and provide a concise brief covering: "
-        f"key facts, likely topics of conversation, potential objections or questions "
-        f"that may arise, and any relevant background information. URL: {url}"
+    if not jina_content:
+        fallback_used = True
+        try:
+            domain = url.split("//")[-1].split("/")[0]
+        except Exception:
+            domain = url
+        jina_content = (
+            f"URL: {url}\nDomain: {domain}\n"
+            "(Direct page content unavailable — brief based on domain context only.)"
+        )
+
+    # Step 2 — Build tier-appropriate Groq prompt
+    if tier == "quick_read":
+        sections_instruction = (
+            f"Build a brief with exactly these sections:\n"
+            f"SUMMARY (2-3 sentences)\n"
+            f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n\n"
+            f"Keep entire brief under 300 words. Be specific not generic."
+        )
+        max_tokens = 500
+    elif tier == "war_room":
+        sections_instruction = (
+            f"Build a structured pre-call intelligence brief with exactly these sections:\n"
+            f"SUMMARY (2-3 sentences)\n"
+            f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n"
+            f"LIKELY OBJECTIONS (3 objections this person or company might raise)\n"
+            f"RECOMMENDED ANGLES (3 tactical approaches given the {persona} persona)\n"
+            f"RISKS TO WATCH (2 things that could go wrong)\n"
+            f"OPENING LINE (one suggested opening line tailored to {role} and {persona})\n"
+            f"COMPETITOR INTELLIGENCE (if detectable from content, otherwise note 'Not detectable')\n"
+            f"NEGOTIATION LEVERAGE POINTS (3 specific leverage points)\n"
+            f"PSYCHOLOGICAL PROFILE (brief profile of likely counterpart based on content)\n\n"
+            f"Keep entire brief under 900 words. Be specific not generic."
+        )
+        max_tokens = 1400
+    else:  # deep_brief
+        sections_instruction = (
+            f"Build a structured pre-call intelligence brief with exactly these sections:\n"
+            f"SUMMARY (2-3 sentences)\n"
+            f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n"
+            f"LIKELY OBJECTIONS (3 objections this person or company might raise)\n"
+            f"RECOMMENDED ANGLES (3 tactical approaches given the {persona} persona)\n"
+            f"RISKS TO WATCH (2 things that could go wrong)\n"
+            f"OPENING LINE (one suggested opening line tailored to {role} and {persona})\n\n"
+            f"Keep entire brief under 600 words. Be specific not generic."
+        )
+        max_tokens = 900
+
+    system_content = (
+        f"You are a pre-call intelligence analyst.\n"
+        f"A user is about to enter a {role} conversation using the {persona} persona.\n"
+        f"They have provided this background material:\n\n"
+        f"{jina_content}\n\n"
+        f"{sections_instruction}"
     )
 
     try:
-        import httpx as _httpx
-        resp = _httpx.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers={
-                "Authorization": f"Bearer {perplexity_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "sonar",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 600,
-            },
-            timeout=30.0,
+        groq_response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": system_content}],
+            max_tokens=max_tokens,
+            temperature=0.4,
         )
-        resp.raise_for_status()
-        brief_text = resp.json()["choices"][0]["message"]["content"].strip()
+        brief_text = groq_response.choices[0].message.content.strip()
     except Exception as e:
         sentry_sdk.capture_exception(e)
-        logger.error(f"Perplexity API error: {e}")
-        raise HTTPException(status_code=500, detail=f"Briefing failed: {str(e)}")
+        logger.error(f"Groq brief generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Brief generation failed: {str(e)}")
 
-    # Deduct 5 credits
+    if fallback_used:
+        brief_text = (
+            "Note: Direct page content unavailable. Brief based on domain context only.\n\n"
+            + brief_text
+        )
+
+    # Step 3 — Deduct credits
     if engine is not None:
-        user_id = f"{device_id}_{user_email}"
         try:
             with engine.connect() as conn:
                 conn.execute(text("""
                     INSERT INTO credits (user_id, balance, plan_type, total_used)
-                    VALUES (:uid, -5, 'free', 5)
+                    VALUES (:uid, :neg_cost, 'free', :cost)
                     ON CONFLICT (user_id) DO UPDATE SET
-                        balance = credits.balance - 5,
-                        total_used = credits.total_used + 5
-                """), {"uid": user_id})
+                        balance = credits.balance - :cost,
+                        total_used = credits.total_used + :cost
+                """), {"uid": user_id, "cost": credits_cost, "neg_cost": -credits_cost})
                 conn.commit()
         except Exception as e:
             logger.error(f"Credits deduction error: {e}")
 
-    logger.info(f"🔍 Brief generated for {url} ({len(brief_text)} chars), 5 credits deducted")
-    return {"brief": brief_text, "url": url, "credits_used": 5}
+    logger.info(f"🔍 {tier} brief for {url} ({len(brief_text)} chars), {credits_cost} credits deducted")
+    return {
+        "brief_text":   brief_text,
+        "brief":        brief_text,   # backwards compatibility
+        "source_url":   url,
+        "role_context": role,
+        "credits_used": credits_cost,
+        "tier":         tier,
+        "fallback":     fallback_used,
+    }
 
 
 # ========================
@@ -2084,7 +2167,7 @@ PLAN_MODES = {
 # Plans that allow TTS audio whisper
 TTS_ALLOWED_PLANS = {"pro", "command", "operator", "founding_50"}
 
-# Plans that allow URL briefing (Perplexity)
+# Plans that allow URL briefing (Jina+Groq)
 BRIEFING_ALLOWED_PLANS = {"command", "operator", "founding_50"}
 
 # Plans that get AI-generated session summaries
