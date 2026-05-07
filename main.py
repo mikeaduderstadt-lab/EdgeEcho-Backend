@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 import email_service
 import uuid as _uuid
 import secrets as _secrets
+import random as _random
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
@@ -325,6 +326,7 @@ customer_plan: dict = {}
 # AUTH CONFIG
 # ========================
 MAGIC_LINK_EXPIRY_MINUTES = int(os.environ.get("MAGIC_LINK_EXPIRY_MINUTES", "30"))
+OTP_EXPIRY_MINUTES        = int(os.environ.get("OTP_EXPIRY_MINUTES",        "10"))
 SESSION_EXPIRY_DAYS       = int(os.environ.get("SESSION_EXPIRY_DAYS",       "30"))
 APP_BASE_URL              = os.environ.get("APP_BASE_URL", "https://cerebroecho.com/app")
 
@@ -643,6 +645,18 @@ def init_db():
         # ── Auth (Phase 2) — email-change token support ───────────────────────
         "ALTER TABLE magic_link_tokens ADD COLUMN IF NOT EXISTS token_type TEXT NOT NULL DEFAULT 'sign_in'",
         "ALTER TABLE magic_link_tokens ADD COLUMN IF NOT EXISTS new_email TEXT",
+        # ── Auth (Phase 3) — email OTP support ───────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS email_otps (
+            id         TEXT PRIMARY KEY,
+            code       TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at    TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS email_otps_acct_idx ON email_otps(account_id)",
+        "CREATE INDEX IF NOT EXISTS email_otps_code_idx ON email_otps(code)",
     ]
     try:
         with engine.connect() as conn:
@@ -722,6 +736,37 @@ def _mark_event_processed(event_id: str, event_type: str) -> None:
 @app.get("/")
 async def root():
     return {"status": "CerebroEcho Backend Live", "version": "1.2.0"}
+
+# ── TEMPORARY ADMIN ENDPOINT — remove after use ──────────────────────────────
+@app.post("/admin/grant-operator")
+async def admin_grant_operator(request: Request, data: dict):
+    secret = data.get("secret", "")
+    if secret != os.environ.get("APP_SECRET", ""):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    email = (data.get("email") or "").strip().lower()
+    if not email or engine is None:
+        raise HTTPException(status_code=400, detail="Bad request or no DB")
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT id FROM accounts WHERE email=:e"), {"e": email}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"No account for {email}")
+        account_id = row[0]
+        result = conn.execute(
+            text("UPDATE credits SET plan_type='operator', balance=999999 WHERE account_id=:aid"),
+            {"aid": account_id}
+        )
+        if result.rowcount == 0:
+            conn.execute(
+                text("INSERT INTO credits (user_id, account_id, balance, plan_type, total_used) VALUES (:uid,:aid,999999,'operator',0)"),
+                {"uid": f"account_{account_id}", "aid": account_id}
+            )
+        conn.commit()
+        row2 = conn.execute(
+            text("SELECT user_id, account_id, balance, plan_type, total_used FROM credits WHERE account_id=:aid"),
+            {"aid": account_id}
+        ).fetchone()
+    return {"ok": True, "user_id": row2[0], "account_id": row2[1], "balance": row2[2], "plan_type": row2[3], "total_used": row2[4]}
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -2994,6 +3039,52 @@ def _verify_magic_link(token: str):
         return None
 
 
+def _create_otp(account_id: str) -> str:
+    """Invalidate unused OTPs for this account and issue a fresh 6-digit code."""
+    code       = f"{_random.SystemRandom().randint(0, 999999):06d}"
+    otp_id     = str(_uuid.uuid4())
+    expires_at = (datetime.utcnow() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                DELETE FROM email_otps WHERE account_id = :aid AND used_at IS NULL
+            """), {"aid": account_id})
+            conn.execute(text("""
+                INSERT INTO email_otps (id, code, account_id, expires_at)
+                VALUES (:id, :code, :aid, :expires)
+            """), {"id": otp_id, "code": code, "aid": account_id, "expires": expires_at})
+            conn.commit()
+    except Exception as e:
+        logger.error(f"_create_otp error: {e}")
+        raise
+    return code
+
+
+def _verify_otp_code(code: str, account_id: str):
+    """Consume an OTP. Returns account_id if valid, None otherwise."""
+    now = datetime.utcnow().isoformat()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT id, expires_at, used_at
+                FROM email_otps WHERE code = :code AND account_id = :aid
+                ORDER BY expires_at DESC LIMIT 1
+            """), {"code": code, "aid": account_id}).fetchone()
+            if not row:
+                return None
+            otp_id, expires_at, used_at = row[0], row[1], row[2]
+            if used_at or expires_at < now:
+                return None
+            conn.execute(text("""
+                UPDATE email_otps SET used_at = :now WHERE id = :id
+            """), {"now": now, "id": otp_id})
+            conn.commit()
+        return account_id
+    except Exception as e:
+        logger.error(f"_verify_otp_code error: {e}")
+        return None
+
+
 def _create_auth_session(account_id: str, device_id: str = "") -> str:
     """Create a rolling 30-day session. Returns the session token."""
     token      = _secrets.token_urlsafe(32)
@@ -3215,6 +3306,77 @@ async def auth_verify_link(request: Request, data: dict):
     _ensure_free_credits(account_id)
 
     logger.info(f"✅ Auth session created: account={account_id[:8]}… device={device_id[:8] if device_id else 'none'}")
+    return {
+        "session_token": session_token,
+        "account_id":    account_id,
+        "email":         email,
+    }
+
+
+@app.post("/auth/request-otp")
+@limiter.limit(RATE_AUTH_REQUEST)
+async def auth_request_otp(request: Request, data: dict):
+    """Send a 6-digit OTP to the user's email. Creates account if new."""
+    email     = (data.get("email") or "").strip().lower()
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
+    if engine is None:
+        raise HTTPException(status_code=503, detail={
+            "code": "SERVICE_UNAVAILABLE",
+            "message": "Sign-in is temporarily unavailable. Please try again in a moment.",
+        })
+    try:
+        account_id = _create_account_or_get(email)
+        code       = _create_otp(account_id)
+        email_service.send_otp_email(email, code)
+        logger.info(f"🔢 OTP sent to {email}")
+    except Exception as e:
+        logger.error(f"auth_request_otp error: {e}")
+        raise HTTPException(status_code=500, detail={
+            "code": "SEND_FAILED",
+            "message": "Failed to send sign-in code. Please try again.",
+        })
+    return {"status": "sent"}
+
+
+@app.post("/auth/verify-otp")
+@limiter.limit(RATE_AUTH_VERIFY)
+async def auth_verify_otp(request: Request, data: dict):
+    """Verify a 6-digit OTP and return a session token."""
+    email     = (data.get("email") or "").strip().lower()
+    code      = (data.get("code") or "").strip()
+    device_id = data.get("deviceId", "")
+
+    if not email or not code:
+        raise HTTPException(status_code=400, detail="Email and code are required.")
+    if engine is None:
+        raise HTTPException(status_code=503, detail={
+            "code": "SERVICE_UNAVAILABLE",
+            "message": "Sign-in is temporarily unavailable. Please try again in a moment.",
+        })
+
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT id FROM accounts WHERE email = :email"),
+                {"email": email}
+            ).fetchone()
+        account_id = row[0] if row else None
+    except Exception as e:
+        logger.error(f"auth_verify_otp: account lookup error: {e}")
+        account_id = None
+
+    if not account_id or not _verify_otp_code(code, account_id):
+        raise HTTPException(status_code=401, detail={
+            "code": "INVALID_OR_EXPIRED_CODE",
+            "message": "That code is incorrect or has expired. Request a new one.",
+        })
+
+    session_token = _create_auth_session(account_id, device_id)
+    _backfill_account_id(account_id, email, device_id)
+    _ensure_free_credits(account_id)
+
+    logger.info(f"✅ OTP auth session created: account={account_id[:8]}… device={device_id[:8] if device_id else 'none'}")
     return {
         "session_token": session_token,
         "account_id":    account_id,
