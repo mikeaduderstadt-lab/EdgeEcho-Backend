@@ -289,6 +289,36 @@ def send_magic_link_email(to: str, magic_url: str) -> bool:
     return send_email(to, subject, _html_wrap(subject, body_html, "Sign in", magic_url), text)
 
 
+def send_otp_email(to: str, code: str) -> bool:
+    """
+    Sent when a user requests an OTP sign-in code.
+    Trigger: POST /auth/request-otp
+    Status: FULLY WIRED
+    """
+    subject = f"{code} — your CerebroEcho sign-in code"
+    body_html = f"""
+      <p style="margin:0 0 8px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        Your sign-in code is:
+      </p>
+      <p style="margin:0 0 24px;font-size:40px;font-weight:700;letter-spacing:0.15em;color:#e2e8f0;font-family:monospace;">
+        {code}
+      </p>
+      <p style="margin:0 0 16px;font-size:13px;line-height:1.6;color:#596272;">
+        Enter this code in the app. It expires in 10 minutes and can only be used once.
+      </p>
+      <p style="margin:0 0 16px;font-size:13px;line-height:1.6;color:#596272;">
+        If you didn't request this, you can safely ignore this email.
+      </p>
+    """
+    text = (
+        f"Your CerebroEcho sign-in code is: {code}\n\n"
+        "Enter it in the app within 10 minutes.\n\n"
+        "If you didn't request this, ignore this email.\n\n"
+        "— CerebroEcho"
+    )
+    return send_email(to, subject, _html_wrap(subject, body_html), text)
+
+
 def send_email_change_request(old_email: str, new_email: str, verify_url: str) -> bool:
     """
     Sent to NEW email asking the user to confirm the address change.
