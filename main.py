@@ -737,37 +737,6 @@ def _mark_event_processed(event_id: str, event_type: str) -> None:
 async def root():
     return {"status": "CerebroEcho Backend Live", "version": "1.2.0"}
 
-# ── TEMPORARY ADMIN ENDPOINT — remove after use ──────────────────────────────
-@app.post("/admin/grant-operator")
-async def admin_grant_operator(request: Request, data: dict):
-    secret = data.get("secret", "")
-    if secret != os.environ.get("APP_SECRET", ""):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    email = (data.get("email") or "").strip().lower()
-    if not email or engine is None:
-        raise HTTPException(status_code=400, detail="Bad request or no DB")
-    with engine.connect() as conn:
-        row = conn.execute(text("SELECT id FROM accounts WHERE email=:e"), {"e": email}).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail=f"No account for {email}")
-        account_id = row[0]
-        result = conn.execute(
-            text("UPDATE credits SET plan_type='operator', balance=999999 WHERE account_id=:aid"),
-            {"aid": account_id}
-        )
-        if result.rowcount == 0:
-            conn.execute(
-                text("INSERT INTO credits (user_id, account_id, balance, plan_type, total_used) VALUES (:uid,:aid,999999,'operator',0)"),
-                {"uid": f"account_{account_id}", "aid": account_id}
-            )
-        conn.commit()
-        row2 = conn.execute(
-            text("SELECT user_id, account_id, balance, plan_type, total_used FROM credits WHERE account_id=:aid"),
-            {"aid": account_id}
-        ).fetchone()
-    return {"ok": True, "user_id": row2[0], "account_id": row2[1], "balance": row2[2], "plan_type": row2[3], "total_used": row2[4]}
-# ─────────────────────────────────────────────────────────────────────────────
-
 @app.get("/health")
 async def health():
     """
