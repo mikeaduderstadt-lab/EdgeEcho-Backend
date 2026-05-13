@@ -267,6 +267,28 @@ def _deduct_credits(user_id: str, cost: int) -> int:
         return -1
 
 
+def _track_usage(user_key: str, user_email: str, event_type: str, units: float, estimated_cost_usd: float, metadata: str | None = None) -> None:
+    """Insert a cost-tracking row. Non-fatal — never raises to caller."""
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO api_usage (user_key, user_email, event_type, units, estimated_cost_usd, metadata)
+                VALUES (:uk, :ue, :et, :units, :cost, :meta)
+            """), {
+                "uk":    user_key or "unknown",
+                "ue":    user_email or "",
+                "et":    event_type,
+                "units": float(units),
+                "cost":  float(estimated_cost_usd),
+                "meta":  metadata,
+            })
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"_track_usage failed ({event_type}): {e}")
+
+
 def _get_credits_user_id(fallback_user_id: str, account_id: str | None) -> str:
     """Return the canonical user_id for credit operations.
 
@@ -657,6 +679,22 @@ def init_db():
         """,
         "CREATE INDEX IF NOT EXISTS email_otps_acct_idx ON email_otps(account_id)",
         "CREATE INDEX IF NOT EXISTS email_otps_code_idx ON email_otps(code)",
+        # ── Per-user API cost tracking ────────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS api_usage (
+            id                  SERIAL PRIMARY KEY,
+            user_key            TEXT NOT NULL,
+            user_email          TEXT,
+            event_type          TEXT NOT NULL,
+            units               REAL NOT NULL,
+            estimated_cost_usd  REAL NOT NULL,
+            metadata            TEXT,
+            created_at          TIMESTAMP DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS api_usage_user_key_idx   ON api_usage(user_key)",
+        "CREATE INDEX IF NOT EXISTS api_usage_created_at_idx ON api_usage(created_at)",
+        "CREATE INDEX IF NOT EXISTS api_usage_event_type_idx ON api_usage(event_type)",
     ]
     try:
         with engine.connect() as conn:
@@ -923,6 +961,8 @@ async def coach(
                 temp_filename = None
 
             transcript = transcription.strip() if transcription else ""
+            _track_usage(user_key, userEmail, "whisper_transcription",
+                         len(content), len(content) / 16000 / 2 * 0.0001)
             if not transcript or len(transcript) < 2:
                 return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "tts_allowed": tts_allowed, "processing_time": round(time.time() - start_time, 3)}
 
@@ -998,6 +1038,8 @@ async def coach(
 
         answer = completion.choices[0].message.content.strip()
         logger.info(f"✅ Full answer text ({len(answer)} chars): {answer[:100]}...")
+        _track_usage(user_key, userEmail, "groq_llm",
+                     len(answer), len(answer) / 4 * 0.0000008)
         credits_remaining = _deduct_credits(user_key, cost)
         if credits_remaining < 0:
             credits_remaining = max(0, credits["balance"] - cost)
@@ -1281,6 +1323,7 @@ async def text_to_speech(request: Request, data: dict):
 
     speed    = float(data.get("speed", 0.85))
     voice_id = data.get("voice_id", "f9836c6e-a0bd-460e-9d3c-f7299fa60f94")
+    _tts_user_key, _, _ = _resolve_user(request, data.get("deviceId", ""), data.get("userEmail", ""))
 
     cartesia_api_key = os.environ.get("CARTESIA_API_KEY")
     if cartesia_api_key:
@@ -1320,6 +1363,8 @@ async def text_to_speech(request: Request, data: dict):
                 logger.error(f"Cartesia stream error: {e}")
                 return  # exhaust generator cleanly; client gets a partial/empty response
 
+        _track_usage(_tts_user_key, data.get("userEmail", ""), "cartesia_tts",
+                     len(text), len(text) * 0.000015)
         return StreamingResponse(cartesia_stream(), media_type="audio/mpeg")
 
     # Fallback: OpenAI TTS (sync client — runs in executor to avoid blocking event loop)
@@ -1334,6 +1379,8 @@ async def text_to_speech(request: Request, data: dict):
             ) as response:
                 yield from response.iter_bytes(chunk_size=4096)
 
+        _track_usage(_tts_user_key, data.get("userEmail", ""), "openai_tts_fallback",
+                     len(text), len(text) * 0.000015)
         return StreamingResponse(_openai_gen(), media_type="audio/mpeg")
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -1585,6 +1632,8 @@ async def brief_url(request: Request, data: dict):
         )
         if jina_resp.status_code == 200 and jina_resp.text.strip():
             jina_content = jina_resp.text[:12000]
+            _track_usage(user_id, user_email, "jina_fetch",
+                         len(jina_content), 0.0, json.dumps({"url": url[:100]}))
     except Exception as e:
         logger.warning(f"Jina fetch failed for {url}: {e}")
 
@@ -1652,6 +1701,9 @@ async def brief_url(request: Request, data: dict):
             temperature=0.4,
         )
         brief_text = groq_response.choices[0].message.content.strip()
+        _track_usage(user_id, user_email, "groq_llm",
+                     len(brief_text), len(brief_text) / 4 * 0.0000008,
+                     json.dumps({"tier": tier}))
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"Groq brief generation error: {e}")
@@ -1965,11 +2017,28 @@ async def get_credits(request: Request, deviceId: str, userEmail: str = "anonymo
                 is_founding = row is not None
         except Exception as e:
             logger.error(f"founding check error: {e}")
+    cost_this_month = 0.0
+    if engine is not None:
+        try:
+            lookup_key = _get_credits_user_id(user_id, account_id)
+            with engine.connect() as conn:
+                r = conn.execute(text("""
+                    SELECT COALESCE(SUM(estimated_cost_usd), 0)
+                    FROM api_usage
+                    WHERE user_key = :uk
+                    AND created_at >= DATE_TRUNC('month', NOW())
+                """), {"uk": lookup_key}).fetchone()
+                if r:
+                    cost_this_month = float(r[0])
+        except Exception as e:
+            logger.error(f"credits: cost_this_month error: {e}")
+
     return {
         "balance": credit_data["balance"],
         "plan_type": credit_data["plan_type"],
         "total_used": credit_data["total_used"],
         "is_founding_member": is_founding,
+        "estimated_cost_this_month": round(cost_this_month, 6),
     }
 
 
@@ -2660,6 +2729,7 @@ async def stripe_webhook(request: Request):
                     logger.info(f"✅ checkout.session.completed: user={user_id} account={account_id} plan={plan} balance={new_balance}")
                     to_email = user_id.split("_", 1)[1] if "_" in user_id else ""
                     email_service.send_upgrade_email(to_email, plan, new_balance)
+                    _track_usage(user_id, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "upgrade", "plan": plan}))
                 except Exception as e:
                     logger.error(f"❌ checkout.session.completed DB error: {e}")
 
@@ -2759,6 +2829,7 @@ async def stripe_webhook(request: Request):
                     )
                     to_email = uid.split("_", 1)[1] if "_" in uid else ""
                     email_service.send_payment_failed_email(to_email, attempt_count, next_str, amount_due)
+                    _track_usage(uid, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "payment_failed"}))
                 except Exception as e:
                     logger.error(f"❌ invoice.payment_failed DB error: {e}")
 
@@ -2880,6 +2951,7 @@ async def stripe_webhook(request: Request):
                     logger.info(f"🚫 subscription.deleted: downgraded {uid} to free | ended_at={ended_str}")
                     to_email = uid.split("_", 1)[1] if "_" in uid else ""
                     email_service.send_cancellation_email(to_email, ended_str)
+                    _track_usage(uid, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "cancellation"}))
                 except Exception as e:
                     logger.error(f"❌ subscription.deleted DB error: {e}")
 
@@ -3200,6 +3272,7 @@ async def save_email(data: dict):
     
     logger.info(f"📧 Email saved: {email}")
     email_service.send_welcome_email(email)
+    _track_usage(email, email, "resend_email", 1, 0.0001, json.dumps({"type": "welcome"}))
     return {"status": "success", "message": "Trial extended to 10 questions"}
 
 # ========================
@@ -3226,6 +3299,7 @@ async def auth_request_link(request: Request, data: dict):
         token      = _create_magic_link(account_id)
         magic_url  = f"{APP_BASE_URL}?magic_token={token}"
         email_service.send_magic_link_email(email, magic_url)
+        _track_usage(email, email, "resend_email", 1, 0.0001, json.dumps({"type": "magic_link"}))
         logger.info(f"🔗 Magic link sent to {email}")
     except Exception as e:
         logger.error(f"auth_request_link error: {e}")
@@ -3298,6 +3372,7 @@ async def auth_request_otp(request: Request, data: dict):
         account_id = _create_account_or_get(email)
         code       = _create_otp(account_id)
         email_service.send_otp_email(email, code)
+        _track_usage(email, email, "resend_email", 1, 0.0001, json.dumps({"type": "otp"}))
         logger.info(f"🔢 OTP sent to {email}")
     except Exception as e:
         logger.error(f"auth_request_otp error: {e}")
@@ -3517,7 +3592,9 @@ async def auth_request_email_change(request: Request, data: dict):
 
     change_url = f"{APP_BASE_URL}?email_change_token={change_token}"
     email_service.send_email_change_request(current_email or "", new_email, change_url)
+    _track_usage(account_id, current_email or "", "resend_email", 1, 0.0001, json.dumps({"type": "email_change_request"}))
     email_service.send_email_change_notification(current_email or "", new_email)
+    _track_usage(account_id, current_email or "", "resend_email", 1, 0.0001, json.dumps({"type": "email_change_notification"}))
 
     logger.info(f"📧 Email change requested: account {account_id[:8]}… → {new_email}")
     return {"status": "sent", "new_email": new_email}
@@ -3587,6 +3664,7 @@ async def auth_verify_email_change(request: Request, data: dict):
 
     try:
         email_service.send_email_changed_confirmation(new_email, old_email)
+        _track_usage(account_id, new_email, "resend_email", 1, 0.0001, json.dumps({"type": "email_changed_confirmation"}))
     except Exception:
         pass  # non-fatal
 
@@ -3596,6 +3674,101 @@ async def auth_verify_email_change(request: Request, data: dict):
         "session_token": session_token,
         "email":         new_email,
     }
+
+
+# ========================
+# ADMIN — COST DASHBOARD
+# ========================
+
+@app.get("/admin/usage-summary")
+async def admin_usage_summary(request: Request):
+    """Internal cost dashboard. Protected by APP_SECRET header (x-app-secret)."""
+    secret   = request.headers.get("x-app-secret", "")
+    expected = os.environ.get("APP_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    now        = datetime.utcnow()
+    cutoff_30d = (now - timedelta(days=30)).isoformat()
+
+    try:
+        with engine.connect() as conn:
+            cost_24h = conn.execute(text("""
+                SELECT COALESCE(SUM(estimated_cost_usd), 0)
+                FROM api_usage WHERE created_at >= NOW() - INTERVAL '24 hours'
+            """)).scalar()
+
+            cost_7d = conn.execute(text("""
+                SELECT COALESCE(SUM(estimated_cost_usd), 0)
+                FROM api_usage WHERE created_at >= NOW() - INTERVAL '7 days'
+            """)).scalar()
+
+            cost_30d = conn.execute(text("""
+                SELECT COALESCE(SUM(estimated_cost_usd), 0)
+                FROM api_usage WHERE created_at >= NOW() - INTERVAL '30 days'
+            """)).scalar()
+
+            top_users = conn.execute(text("""
+                SELECT user_key, user_email,
+                       SUM(estimated_cost_usd) AS total_cost,
+                       COUNT(*) AS event_count
+                FROM api_usage
+                WHERE created_at >= NOW() - INTERVAL '30 days'
+                GROUP BY user_key, user_email
+                ORDER BY total_cost DESC
+                LIMIT 10
+            """)).fetchall()
+
+            by_event = conn.execute(text("""
+                SELECT event_type,
+                       COUNT(*) AS event_count,
+                       SUM(units) AS total_units,
+                       SUM(estimated_cost_usd) AS total_cost
+                FROM api_usage
+                WHERE created_at >= NOW() - INTERVAL '30 days'
+                GROUP BY event_type
+                ORDER BY total_cost DESC
+            """)).fetchall()
+
+            session_count = conn.execute(text("""
+                SELECT COUNT(*) FROM session_history
+                WHERE timestamp >= :cutoff
+            """), {"cutoff": cutoff_30d}).scalar()
+
+        avg_cost = (float(cost_30d) / int(session_count)) if session_count else 0.0
+
+        return {
+            "total_cost_usd": {
+                "last_24h": round(float(cost_24h), 6),
+                "last_7d":  round(float(cost_7d), 6),
+                "last_30d": round(float(cost_30d), 6),
+            },
+            "top_users_last_30d": [
+                {
+                    "user_key":    r[0],
+                    "user_email":  r[1],
+                    "total_cost":  round(float(r[2]), 6),
+                    "event_count": int(r[3]),
+                }
+                for r in top_users
+            ],
+            "by_event_type_last_30d": [
+                {
+                    "event_type":  r[0],
+                    "event_count": int(r[1]),
+                    "total_units": round(float(r[2]), 2),
+                    "total_cost":  round(float(r[3]), 6),
+                }
+                for r in by_event
+            ],
+            "avg_cost_per_session_last_30d": round(avg_cost, 6),
+            "session_count_last_30d": int(session_count or 0),
+        }
+    except Exception as e:
+        logger.error(f"admin_usage_summary error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
