@@ -341,6 +341,62 @@ def reset_expired_credits():
 
 usage_tracker = {}  # kept for non-primary endpoints only
 
+
+# ========================
+# SESSION CONTEXT CACHE
+# Stores uploaded file text or brief text in the preferences table under a
+# special user_id key so context survives a page refresh within a session.
+# Cleared automatically when /end-session is called.
+# ========================
+
+def _save_ctx_cache(user_key: str, text: str) -> None:
+    if engine is None or not user_key or not text:
+        return
+    cache_id = f"{user_key}::ctx_cache"
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO preferences (user_id, preference_text, updated_at)
+                VALUES (:uid, :txt, :now)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    preference_text = EXCLUDED.preference_text,
+                    updated_at      = EXCLUDED.updated_at
+            """), {"uid": cache_id, "txt": text, "now": datetime.utcnow().isoformat()})
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"_save_ctx_cache failed: {e}")
+
+
+def _get_ctx_cache(user_key: str) -> str:
+    if engine is None or not user_key:
+        return ""
+    cache_id = f"{user_key}::ctx_cache"
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT preference_text FROM preferences WHERE user_id = :uid"),
+                {"uid": cache_id}
+            ).fetchone()
+        return row[0] if row else ""
+    except Exception as e:
+        logger.warning(f"_get_ctx_cache failed: {e}")
+        return ""
+
+
+def _clear_ctx_cache(user_key: str) -> None:
+    if engine is None or not user_key:
+        return
+    cache_id = f"{user_key}::ctx_cache"
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("DELETE FROM preferences WHERE user_id = :uid"),
+                {"uid": cache_id}
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"_clear_ctx_cache failed: {e}")
+
 # Keyed by Stripe customer ID → {"plan": str, "status": "active"|"payment_failed"|"revoked"}
 customer_plan: dict = {}
 
@@ -501,22 +557,42 @@ def build_system_prompt(
     prior_context: str = "",
     session_context: str = "",
     user_preferences: str = "",
+    custom_role_description: str = "",
+    custom_persona_description: str = "",
 ) -> tuple:
     parts = [ROLE_PROMPTS.get(role, _DEFAULT_ROLE)]
 
     if context and context not in ("", "a professional role"):
-        parts.append(f"Session context: {context}")
+        if role == "Custom":
+            parts.append(f"User-defined custom role description: {context}")
+        else:
+            parts.append(f"Session context: {context}")
     if work_history and work_history not in ("", "no work history provided"):
         parts.append(f"User background: {work_history}")
     if prior_context:
         parts.append(prior_context)
-    if session_context and session_context.strip():
-        parts.append(f"Context provided by user:\n{session_context.strip()[:6000]}")
+    # FIX 2/7: custom_role_description is the dedicated field for operator custom role text.
+    # When present it is labeled explicitly so Groq knows what it is; session_context
+    # is appended alongside it as "Additional context" rather than a separate block.
+    if custom_role_description and custom_role_description.strip():
+        if session_context and session_context.strip():
+            parts.append(
+                f"User-defined custom role: {custom_role_description.strip()}\n\n"
+                f"Additional context:\n{session_context.strip()[:8000]}"
+            )
+        else:
+            parts.append(f"User-defined custom role: {custom_role_description.strip()}")
+    elif session_context and session_context.strip():
+        parts.append(f"Context provided by user:\n{session_context.strip()[:8000]}")
     if user_preferences and user_preferences.strip():
         parts.append(f"User preferences: {user_preferences.strip()}")
 
     persona_mod = PERSONA_MODIFIERS.get(persona, "")
-    if persona_mod:
+    # FIX 3: when persona is Custom and the user typed a description, label it
+    # explicitly so Groq understands it as the persona directive, not generic context.
+    if persona == "Custom" and custom_persona_description and custom_persona_description.strip():
+        parts.append(f"User-defined custom persona: {custom_persona_description.strip()}")
+    elif persona_mod:
         parts.append(persona_mod)
 
     style_cfg = STYLE_CONFIG.get(style, STYLE_CONFIG["Nudge"])
@@ -889,6 +965,8 @@ async def coach(
     session_context: str = Form(""),
     user_preferences: str = Form(""),
     ghost_mode: str = Form("false"),
+    custom_role_description: str = Form(""),
+    custom_persona_description: str = Form(""),
 ):
     if client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
@@ -1009,6 +1087,11 @@ async def coach(
         if prior:
             prior_context = "PREVIOUS SESSIONS:\n" + "\n---\n".join(prior)
 
+        # FIX 6: fall back to cached context if the request carries none (e.g. after page refresh)
+        effective_session_context = session_context
+        if not effective_session_context.strip() and ghost_mode.lower() != "true":
+            effective_session_context = _get_ctx_cache(user_key)
+
         system_prompt, max_tokens = build_system_prompt(
             role=role,
             persona=persona,
@@ -1016,10 +1099,12 @@ async def coach(
             context=context,
             work_history=work_history,
             prior_context=prior_context,
-            session_context=session_context,
+            session_context=effective_session_context,
             user_preferences=user_preferences,
+            custom_role_description=custom_role_description,
+            custom_persona_description=custom_persona_description,
         )
-        logger.info(f"🧠 Role={role} | Persona={persona} | Style={style} | ctx={len(session_context)}c | prefs={len(user_preferences)}c | max_tokens={max_tokens}")
+        logger.info(f"🧠 Role={role} | Persona={persona} | Style={style} | ctx={len(effective_session_context)}c | prefs={len(user_preferences)}c | max_tokens={max_tokens}")
 
         # Build messages with rolling session history as conversation turns
         messages = [{"role": "system", "content": system_prompt}]
@@ -1540,6 +1625,7 @@ async def upload_context(
     request: Request,
     file: UploadFile = File(...),
     deviceId: str = Form(""),
+    userEmail: str = Form("anonymous"),
 ):
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -1575,6 +1661,9 @@ async def upload_context(
         extracted = extracted[:8000] + "...[truncated]"
 
     logger.info(f"📄 upload-context: {file.filename} → {len(extracted)} chars")
+    # FIX 6: cache so context survives a page refresh within the session
+    if deviceId:
+        _save_ctx_cache(f"{deviceId}_{userEmail}", extracted)
     return {"text": extracted, "filename": file.filename, "chars": len(extracted)}
 
 
@@ -1609,8 +1698,9 @@ async def brief_url(request: Request, data: dict):
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
-    # Plan gate: Command+ only
-    user_id   = f"{device_id}_{user_email}"
+    # Plan gate: Command+ only — use _resolve_user for cross-device consistency
+    user_id, account_id, _ = _resolve_user(request, device_id, user_email)
+    user_id = _get_credits_user_id(user_id, account_id)
     plan_info = _get_credit_balance(user_id)
     if plan_info["plan_type"] not in BRIEFING_ALLOWED_PLANS:
         raise HTTPException(status_code=403, detail={
@@ -1624,12 +1714,13 @@ async def brief_url(request: Request, data: dict):
     fallback_used = False
     try:
         import httpx as _httpx
-        jina_resp = _httpx.get(
-            f"https://r.jina.ai/{url}",
-            headers={"Accept": "text/plain"},
-            follow_redirects=True,
-            timeout=20.0,
-        )
+        async with _httpx.AsyncClient() as _jina_http:
+            jina_resp = await _jina_http.get(
+                f"https://r.jina.ai/{url}",
+                headers={"Accept": "text/plain"},
+                follow_redirects=True,
+                timeout=20.0,
+            )
         if jina_resp.status_code == 200 and jina_resp.text.strip():
             jina_content = jina_resp.text[:12000]
             _track_usage(user_id, user_email, "jina_fetch",
@@ -1714,6 +1805,9 @@ async def brief_url(request: Request, data: dict):
             "Note: Direct page content unavailable. Brief based on domain context only.\n\n"
             + brief_text
         )
+
+    # FIX 6: cache brief text so it survives a page refresh within the session
+    _save_ctx_cache(user_id, brief_text)
 
     # Step 3 — Deduct credits
     if engine is not None:
@@ -1820,6 +1914,7 @@ async def end_session(request: Request, data: dict):
     if ghost_mode:
         user_key = f"{device_id}_{user_email}"
         question_buffer.pop(user_key, None)
+        _clear_ctx_cache(user_key)
         logger.info(f"👻 Ghost session ended — memory wiped for {user_key[:20]}…")
         return {"status": "ghost", "summary": ""}
 
@@ -1877,6 +1972,8 @@ async def end_session(request: Request, data: dict):
         except Exception as e:
             logger.error(f"end-session DB error: {e}")
 
+    # FIX 6: clear context cache now that the session is over
+    _clear_ctx_cache(f"{device_id}_{user_email}")
     logger.info(f"📝 end-session {session_id[:8]}… | {role}/{persona} | {duration_seconds}s | {summary[:50]}")
     return {"status": "saved", "summary": summary}
 
