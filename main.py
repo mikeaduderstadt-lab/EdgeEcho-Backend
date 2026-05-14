@@ -2752,9 +2752,12 @@ async def stripe_webhook(request: Request):
     except stripe.errors.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    event_id   = event["id"]
-    event_type = event["type"]
-    obj        = event["data"]["object"]
+    # Parse raw payload as plain dict so all .get() calls work regardless of
+    # stripe-sdk version (v10+ returns typed objects, not dicts).
+    raw        = json.loads(payload)
+    event_id   = raw["id"]
+    event_type = raw["type"]
+    obj        = raw["data"]["object"]
 
     # ── Idempotency: Stripe retries on non-2xx; skip already-processed events ──
     if _is_duplicate_event(event_id):
