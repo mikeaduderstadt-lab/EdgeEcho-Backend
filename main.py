@@ -209,13 +209,11 @@ PLAN_CREDITS = {
 }
 
 STYLE_COSTS = {
-    "Pulse":     1,
-    "Signal":    2,
-    "Compose":   4,
-    # legacy aliases
+    "Quick":     1,
+    "Standard":  2,
+    "Full":      4,
     "Nudge":     1,
     "Brief":     2,
-    "Full":      4,
     "shorthand": 1,
     "bullet":    2,
     "script":    2,
@@ -495,7 +493,7 @@ The user has defined their own role for this session. Apply the user's custom ro
 """,
 }
 
-PERSONA_MODIFIERS = {
+MODE_MODIFIERS = {
     "Diplomat": (
         "Respond with measured precision. De-escalate where possible. "
         "Choose words that preserve relationships while holding position."
@@ -530,13 +528,11 @@ Respond in the voice of a classic cartoon pirate — bold, theatrical, colorful 
 }
 
 STYLE_CONFIG = {
-    "Pulse":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
-    "Signal":    {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
-    "Compose":   {"instruction": "Respond with complete, polished phrasing. Up to 2000 characters. Use when the moment requires a fully formed response.", "max_tokens": 550},
-    # Legacy aliases kept for backward compatibility
+    "Quick":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
+    "Standard":  {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
+    "Full":      {"instruction": "Respond with complete, polished phrasing. Up to 2000 characters. Use when the moment requires a fully formed response.", "max_tokens": 550},
     "Nudge":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
     "Brief":     {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
-    "Full":      {"instruction": "Respond with complete, polished phrasing. Up to 2000 characters. Use when the moment requires a fully formed response.", "max_tokens": 550},
     "shorthand": {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters.", "max_tokens": 80},
     "bullet":    {"instruction": "Provide 3 tactical bullet points. Max 100 words total.", "max_tokens": 200},
     "script":    {"instruction": "Provide a 2-3 sentence tactical answer. Be concise and confident.", "max_tokens": 150},
@@ -550,7 +546,7 @@ _DEFAULT_ROLE = (
 
 def build_system_prompt(
     role: str,
-    persona: str,
+    mode: str,
     style: str,
     context: str = "",
     work_history: str = "",
@@ -558,7 +554,7 @@ def build_system_prompt(
     session_context: str = "",
     user_preferences: str = "",
     custom_role_description: str = "",
-    custom_persona_description: str = "",
+    custom_mode_description: str = "",
 ) -> tuple:
     parts = [ROLE_PROMPTS.get(role, _DEFAULT_ROLE)]
 
@@ -584,15 +580,15 @@ def build_system_prompt(
             parts.append(f"User-defined custom role: {custom_role_description.strip()}")
     elif session_context and session_context.strip():
         parts.append(f"Context provided by user:\n{session_context.strip()[:8000]}")
-    persona_mod = PERSONA_MODIFIERS.get(persona, "")
-    # FIX 3: when persona is Custom and the user typed a description, label it
-    # explicitly so Groq understands it as the persona directive, not generic context.
-    if persona == "Custom" and custom_persona_description and custom_persona_description.strip():
-        parts.append(f"User-defined custom persona: {custom_persona_description.strip()}")
-    elif persona_mod:
-        parts.append(persona_mod)
+    mode_mod = MODE_MODIFIERS.get(mode, "")
+    # FIX 3: when mode is Custom and the user typed a description, label it
+    # explicitly so Groq understands it as the mode directive, not generic context.
+    if mode == "Custom" and custom_mode_description and custom_mode_description.strip():
+        parts.append(f"User-defined custom mode: {custom_mode_description.strip()}")
+    elif mode_mod:
+        parts.append(mode_mod)
 
-    style_cfg = STYLE_CONFIG.get(style, STYLE_CONFIG["Nudge"])
+    style_cfg = STYLE_CONFIG.get(style, STYLE_CONFIG["Standard"])
     parts.append(style_cfg["instruction"])
     parts.append(
         "Return ONLY the answer the user should say. "
@@ -960,9 +956,9 @@ async def coach(
     userEmail: str = Form("anonymous"),
     context: str = Form("a professional role"),
     work_history: str = Form(""),
-    style: str = Form("Nudge"),
+    style: str = Form("Standard"),
     role: str = Form("Interview Coach"),
-    persona: str = Form("Diplomat"),
+    mode: str = Form("Diplomat"),
     session_history: str = Form(""),
     prior_summaries: str = Form(""),
     filter_small_talk: str = Form("false"),
@@ -970,7 +966,7 @@ async def coach(
     user_preferences: str = Form(""),
     ghost_mode: str = Form("false"),
     custom_role_description: str = Form(""),
-    custom_persona_description: str = Form(""),
+    custom_mode_description: str = Form(""),
 ):
     if client is None:
         raise HTTPException(status_code=503, detail="AI service unavailable - check server configuration")
@@ -988,13 +984,13 @@ async def coach(
     # Silently downgrade operator-only options for lower plans
     if role in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
         role = "Interview Coach"
-    if persona in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
-        persona = "Diplomat"
+    if mode in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
+        mode = "Diplomat"
 
-    # Free plan: Pulse + Signal only (no Compose/Full — 4-credit responses)
-    if plan_type == "free" and style in ("Full", "Compose"):
-        style = "Signal"
-        cost = STYLE_COSTS["Signal"]
+    # Free plan: Quick + Standard only (no Full — 4-credit responses)
+    if plan_type == "free" and style == "Full":
+        style = "Standard"
+        cost = STYLE_COSTS["Standard"]
 
     if credits["balance"] < cost:
         raise HTTPException(status_code=402, detail={
@@ -1098,7 +1094,7 @@ async def coach(
 
         system_prompt, max_tokens = build_system_prompt(
             role=role,
-            persona=persona,
+            mode=mode,
             style=style,
             context=context,
             work_history=work_history,
@@ -1106,10 +1102,10 @@ async def coach(
             session_context=effective_session_context,
             user_preferences=user_preferences,
             custom_role_description=custom_role_description,
-            custom_persona_description=custom_persona_description,
+            custom_mode_description=custom_mode_description,
         )
-        logger.info(f"🧠 Role={role} | Persona={persona} | Style={style} | ctx={len(effective_session_context)}c | prefs={len(user_preferences)}c | max_tokens={max_tokens}")
-        logger.info(f"📋 SYSTEM PROMPT [{role}/{persona}/{style}]:\n{'─'*60}\n{system_prompt}\n{'─'*60}")
+        logger.info(f"🧠 Role={role} | Mode={mode} | Style={style} | ctx={len(effective_session_context)}c | prefs={len(user_preferences)}c | max_tokens={max_tokens}")
+        logger.info(f"📋 SYSTEM PROMPT [{role}/{mode}/{style}]:\n{'─'*60}\n{system_prompt}\n{'─'*60}")
 
         # Build messages with rolling session history as conversation turns
         messages = [{"role": "system", "content": system_prompt}]
@@ -1691,8 +1687,8 @@ async def brief_url(request: Request, data: dict):
     url        = data.get("url", "").strip()
     device_id  = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
-    role       = (data.get("role", "")    or "General").strip()
-    persona    = (data.get("persona", "") or "Analyst").strip()
+    role       = (data.get("role", "")   or "General").strip()
+    mode       = (data.get("mode", "")   or "Analyst").strip()
     tier       = (data.get("tier", "deep_brief") or "deep_brief").strip()
 
     if tier not in BRIEFING_TIER_CREDITS:
@@ -1759,9 +1755,9 @@ async def brief_url(request: Request, data: dict):
             f"SUMMARY (2-3 sentences)\n"
             f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n"
             f"LIKELY OBJECTIONS (3 objections this person or company might raise)\n"
-            f"RECOMMENDED ANGLES (3 tactical approaches given the {persona} persona)\n"
+            f"RECOMMENDED ANGLES (3 tactical approaches given the {mode} mode)\n"
             f"RISKS TO WATCH (2 things that could go wrong)\n"
-            f"OPENING LINE (one suggested opening line tailored to {role} and {persona})\n"
+            f"OPENING LINE (one suggested opening line tailored to {role} and {mode})\n"
             f"COMPETITOR INTELLIGENCE (if detectable from content, otherwise note 'Not detectable')\n"
             f"NEGOTIATION LEVERAGE POINTS (3 specific leverage points)\n"
             f"PSYCHOLOGICAL PROFILE (brief profile of likely counterpart based on content)\n\n"
@@ -1774,16 +1770,16 @@ async def brief_url(request: Request, data: dict):
             f"SUMMARY (2-3 sentences)\n"
             f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n"
             f"LIKELY OBJECTIONS (3 objections this person or company might raise)\n"
-            f"RECOMMENDED ANGLES (3 tactical approaches given the {persona} persona)\n"
+            f"RECOMMENDED ANGLES (3 tactical approaches given the {mode} mode)\n"
             f"RISKS TO WATCH (2 things that could go wrong)\n"
-            f"OPENING LINE (one suggested opening line tailored to {role} and {persona})\n\n"
+            f"OPENING LINE (one suggested opening line tailored to {role} and {mode})\n\n"
             f"Keep entire brief under 600 words. Be specific not generic."
         )
         max_tokens = 900
 
     system_content = (
         f"You are a pre-call intelligence analyst.\n"
-        f"A user is about to enter a {role} conversation using the {persona} persona.\n"
+        f"A user is about to enter a {role} conversation using the {mode} mode.\n"
         f"They have provided this background material:\n\n"
         f"{jina_content}\n\n"
         f"{sections_instruction}"
@@ -1909,8 +1905,8 @@ async def end_session(request: Request, data: dict):
     device_id  = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
     role       = data.get("role", "Interview Coach")
-    persona    = data.get("persona", "Diplomat")
-    style      = data.get("style", "Nudge")
+    mode       = data.get("mode", "Diplomat")
+    style      = data.get("style", "Standard")
     transcript = data.get("transcript", [])
     duration_seconds = int(data.get("duration_seconds", 0))
     ghost_mode = bool(data.get("ghost_mode", False))
@@ -1958,7 +1954,7 @@ async def end_session(request: Request, data: dict):
                 conn.execute(text("""
                     INSERT INTO session_history
                         (session_id, user_id, account_id, role, persona, style, summary, timestamp, duration_seconds)
-                    VALUES (:sid, :uid, :aid, :role, :persona, :style, :summary, :ts, :dur)
+                    VALUES (:sid, :uid, :aid, :role, :mode, :style, :summary, :ts, :dur)
                     ON CONFLICT (session_id) DO UPDATE SET
                         summary    = EXCLUDED.summary,
                         account_id = COALESCE(session_history.account_id, EXCLUDED.account_id)
@@ -1967,7 +1963,7 @@ async def end_session(request: Request, data: dict):
                     "uid": user_id,
                     "aid": account_id,
                     "role": role,
-                    "persona": persona,
+                    "mode": mode,
                     "style": style,
                     "summary": summary,
                     "ts": datetime.utcnow().isoformat(),
@@ -1979,7 +1975,7 @@ async def end_session(request: Request, data: dict):
 
     # FIX 6: clear context cache now that the session is over
     _clear_ctx_cache(f"{device_id}_{user_email}")
-    logger.info(f"📝 end-session {session_id[:8]}… | {role}/{persona} | {duration_seconds}s | {summary[:50]}")
+    logger.info(f"📝 end-session {session_id[:8]}… | {role}/{mode} | {duration_seconds}s | {summary[:50]}")
     return {"status": "saved", "summary": summary}
 
 
@@ -2066,7 +2062,7 @@ async def get_session_history(request: Request, deviceId: str, userEmail: str = 
             {
                 "session_id": r[0],
                 "role": r[1],
-                "persona": r[2],
+                "mode": r[2],
                 "style": r[3],
                 "summary": r[4],
                 "timestamp": r[5],
@@ -2504,7 +2500,7 @@ async def export_data(request: Request, deviceId: str, userEmail: str = "anonymo
                 {
                     "session_id": r[0],
                     "role": r[1],
-                    "persona": r[2],
+                    "mode": r[2],
                     "style": r[3],
                     "summary": r[4],
                     "timestamp": r[5],
@@ -3878,24 +3874,24 @@ async def admin_usage_summary(request: Request):
 
 @app.get("/debug/prompts")
 async def debug_prompts(request: Request):
-    """Return exact system prompts for every role×persona×style combo. Protected by APP_SECRET."""
+    """Return exact system prompts for every role×mode×style combo. Protected by APP_SECRET."""
     secret   = request.headers.get("x-app-secret", "")
     expected = os.environ.get("APP_SECRET", "")
     if not expected or secret != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    roles    = list(ROLE_PROMPTS.keys())
-    personas = list(PERSONA_MODIFIERS.keys())
-    styles   = list(STYLE_CONFIG.keys())
+    roles  = list(ROLE_PROMPTS.keys())
+    modes  = list(MODE_MODIFIERS.keys())
+    styles = list(STYLE_CONFIG.keys())
 
     results = []
     for role in roles:
-        for persona in personas:
+        for mode in modes:
             for style in styles:
-                prompt, max_tok = build_system_prompt(role=role, persona=persona, style=style)
+                prompt, max_tok = build_system_prompt(role=role, mode=mode, style=style)
                 results.append({
                     "role": role,
-                    "persona": persona,
+                    "mode": mode,
                     "style": style,
                     "max_tokens": max_tok,
                     "system_prompt": prompt,
