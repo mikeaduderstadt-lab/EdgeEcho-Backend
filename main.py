@@ -584,9 +584,6 @@ def build_system_prompt(
             parts.append(f"User-defined custom role: {custom_role_description.strip()}")
     elif session_context and session_context.strip():
         parts.append(f"Context provided by user:\n{session_context.strip()[:8000]}")
-    if user_preferences and user_preferences.strip():
-        parts.append(f"User preferences: {user_preferences.strip()}")
-
     persona_mod = PERSONA_MODIFIERS.get(persona, "")
     # FIX 3: when persona is Custom and the user typed a description, label it
     # explicitly so Groq understands it as the persona directive, not generic context.
@@ -601,6 +598,13 @@ def build_system_prompt(
         "Return ONLY the answer the user should say. "
         "No preamble, no labels, no meta-commentary. Start directly with the answer."
     )
+
+    # User preferences placed LAST so the model sees them with highest recency weight.
+    if user_preferences and user_preferences.strip():
+        parts.append(
+            f"CRITICAL USER INSTRUCTIONS — highest priority, always follow these exactly: "
+            f"{user_preferences.strip()}"
+        )
 
     return "\n\n".join(parts), style_cfg["max_tokens"]
 
@@ -1105,6 +1109,7 @@ async def coach(
             custom_persona_description=custom_persona_description,
         )
         logger.info(f"🧠 Role={role} | Persona={persona} | Style={style} | ctx={len(effective_session_context)}c | prefs={len(user_preferences)}c | max_tokens={max_tokens}")
+        logger.info(f"📋 SYSTEM PROMPT [{role}/{persona}/{style}]:\n{'─'*60}\n{system_prompt}\n{'─'*60}")
 
         # Build messages with rolling session history as conversation turns
         messages = [{"role": "system", "content": system_prompt}]
@@ -3869,6 +3874,34 @@ async def admin_usage_summary(request: Request):
     except Exception as e:
         logger.error(f"admin_usage_summary error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/prompts")
+async def debug_prompts(request: Request):
+    """Return exact system prompts for every role×persona×style combo. Protected by APP_SECRET."""
+    secret   = request.headers.get("x-app-secret", "")
+    expected = os.environ.get("APP_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    roles    = list(ROLE_PROMPTS.keys())
+    personas = list(PERSONA_MODIFIERS.keys())
+    styles   = list(STYLE_CONFIG.keys())
+
+    results = []
+    for role in roles:
+        for persona in personas:
+            for style in styles:
+                prompt, max_tok = build_system_prompt(role=role, persona=persona, style=style)
+                results.append({
+                    "role": role,
+                    "persona": persona,
+                    "style": style,
+                    "max_tokens": max_tok,
+                    "system_prompt": prompt,
+                })
+
+    return {"count": len(results), "prompts": results}
 
 
 if __name__ == "__main__":
