@@ -1,4 +1,4 @@
-import io
+﻿import io
 import os
 import json
 import tempfile
@@ -488,8 +488,8 @@ ROLE_PROMPTS = {
         "Do not editorialize."
     ),
     "Custom": """
-You are CerebroEcho in Custom Role mode.
-The user has defined their own role for this session. Apply the user's custom role description as your primary behavioral directive. Adapt your coaching style, tactics, and responses to serve whatever scenario the user has defined. If no custom description was provided, default to general conversation intelligence — help the user navigate the conversation with clarity and confidence.
+You are CerebroEcho in Custom Identity mode.
+The user has defined their own identity for this session. Apply the user's custom identity description as your primary behavioral directive. Adapt your coaching style, tactics, and responses to serve whatever scenario the user has defined. If no custom description was provided, default to general conversation intelligence — help the user navigate the conversation with clarity and confidence.
 """,
 }
 
@@ -520,7 +520,7 @@ MODE_MODIFIERS = {
         "Lead with the bigger picture before the tactical detail."
     ),
     "Custom": """
-The user has defined their own persona for this session. Apply the user's custom persona description to shape how you think, respond, and frame suggestions. Honor the spirit and style of their definition. If no custom description was provided, respond with balanced judgment — direct but not aggressive, clear but not cold.
+The user has defined their own tone for this session. Apply the user's custom tone description to shape how you think, respond, and frame suggestions. Honor the spirit and style of their definition. If no custom description was provided, respond with balanced judgment — direct but not aggressive, clear but not cold.
 """,
     "Pirate": """
 Respond in the voice of a classic cartoon pirate — bold, theatrical, colorful with nautical language and pirate vocabulary. Despite the colorful delivery the actual advice must still be genuinely useful and tactically sound. Never break character.
@@ -560,31 +560,31 @@ def build_system_prompt(
 
     if context and context not in ("", "a professional role"):
         if role == "Custom":
-            parts.append(f"User-defined custom role description: {context}")
+            parts.append(f"User-defined custom identity description: {context}")
         else:
             parts.append(f"Session context: {context}")
     if work_history and work_history not in ("", "no work history provided"):
         parts.append(f"User background: {work_history}")
     if prior_context:
         parts.append(prior_context)
-    # FIX 2/7: custom_role_description is the dedicated field for operator custom role text.
+    # FIX 2/7: custom_role_description is the dedicated field for operator custom identity text.
     # When present it is labeled explicitly so Groq knows what it is; session_context
     # is appended alongside it as "Additional context" rather than a separate block.
     if custom_role_description and custom_role_description.strip():
         if session_context and session_context.strip():
             parts.append(
-                f"User-defined custom role: {custom_role_description.strip()}\n\n"
+                f"User-defined custom identity: {custom_role_description.strip()}\n\n"
                 f"Additional context:\n{session_context.strip()[:8000]}"
             )
         else:
-            parts.append(f"User-defined custom role: {custom_role_description.strip()}")
+            parts.append(f"User-defined custom identity: {custom_role_description.strip()}")
     elif session_context and session_context.strip():
         parts.append(f"Context provided by user:\n{session_context.strip()[:8000]}")
     mode_mod = MODE_MODIFIERS.get(mode, "")
     # FIX 3: when mode is Custom and the user typed a description, label it
     # explicitly so Groq understands it as the mode directive, not generic context.
     if mode == "Custom" and custom_mode_description and custom_mode_description.strip():
-        parts.append(f"User-defined custom mode: {custom_mode_description.strip()}")
+        parts.append(f"User-defined custom tone: {custom_mode_description.strip()}")
     elif mode_mod:
         parts.append(mode_mod)
 
