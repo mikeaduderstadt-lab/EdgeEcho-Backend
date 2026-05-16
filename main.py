@@ -488,8 +488,8 @@ ROLE_PROMPTS = {
         "Do not editorialize."
     ),
     "Custom": """
-You are CerebroEcho in Custom Identity mode.
-The user has defined their own identity for this session. Apply the user's custom identity description as your primary behavioral directive. Adapt your coaching style, tactics, and responses to serve whatever scenario the user has defined. If no custom description was provided, default to general conversation intelligence — help the user navigate the conversation with clarity and confidence.
+You are CerebroEcho in Custom Persona mode.
+The user has defined their own persona for this session. Apply the user's custom persona description as your primary behavioral directive. Adapt your coaching style, tactics, and responses to serve whatever scenario the user has defined. If no custom description was provided, default to general conversation intelligence — help the user navigate the conversation with clarity and confidence.
 """,
 }
 
@@ -859,7 +859,7 @@ async def health():
     503 when any critical dependency is degraded.
 
     Critical (affect HTTP status): db, groq, deepgram
-    Non-critical (informational only): openai, cartesia, stripe, resend, perplexity
+    Non-critical (informational only): openai, cartesia, stripe, resend
     """
     checks: dict = {}
 
@@ -893,7 +893,6 @@ async def health():
         "openai":      openai_client is not None,
         "stripe":      bool(os.getenv("STRIPE_SECRET_KEY")),
         "resend":      bool(os.getenv("RESEND_API_KEY")),
-        "perplexity":  bool(os.getenv("PERPLEXITY_API_KEY")),
     })
 
     healthy = db_ok and groq_ok and deepgram_ok
