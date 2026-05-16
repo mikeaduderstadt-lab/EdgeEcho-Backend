@@ -166,7 +166,7 @@ def send_welcome_email(to: str) -> bool:
       <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
         Your free account includes
         <span style="color:#E8EDF2;font-weight:600;">30 credits</span> to get started.
-        Pick a role, choose a persona, and start your first session.
+        Pick a role, choose a mode, and start your first session.
       </p>
       <p style="margin:0;font-size:13px;line-height:1.6;color:#596272;">
         Need more credits or audio whisper? Upgrade anytime from inside the app.
@@ -174,7 +174,7 @@ def send_welcome_email(to: str) -> bool:
     """
     text = (
         "Welcome to CerebroEcho.\n\n"
-        "Your free account includes 30 credits. Pick a role, choose a persona, "
+        "Your free account includes 30 credits. Pick a role, choose a mode, "
         "and start your first session at cerebroecho.com/app.\n\n"
         "Need more credits or audio whisper? Upgrade anytime from inside the app.\n\n"
         "— CerebroEcho"
