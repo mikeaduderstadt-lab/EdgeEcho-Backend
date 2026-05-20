@@ -22,6 +22,7 @@ import email_service
 import uuid as _uuid
 import secrets as _secrets
 import random as _random
+import asyncio
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
@@ -339,6 +340,101 @@ def reset_expired_credits():
 
 
 usage_tracker = {}  # kept for non-primary endpoints only
+
+
+# ========================
+# ONBOARDING EMAIL HELPERS
+# ========================
+
+def _log_onboarding_email(account_id: str, email_type: str) -> None:
+    """Record that an onboarding email was sent or handled. Idempotent via UNIQUE constraint."""
+    if engine is None or not account_id:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO email_log (account_id, email_type, sent_at)
+                VALUES (:aid, :etype, :now)
+                ON CONFLICT (account_id, email_type) DO NOTHING
+            """), {"aid": account_id, "etype": email_type, "now": datetime.utcnow().isoformat()})
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"_log_onboarding_email error: {e}")
+
+
+def _has_onboarding_email_sent(account_id: str, email_type: str) -> bool:
+    if engine is None or not account_id:
+        return False
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT 1 FROM email_log WHERE account_id = :aid AND email_type = :etype"),
+                {"aid": account_id, "etype": email_type}
+            ).fetchone()
+        return row is not None
+    except Exception as e:
+        logger.warning(f"_has_onboarding_email_sent error: {e}")
+        return False
+
+
+def _process_onboarding_emails() -> None:
+    """Send pending 24h and 72h onboarding emails. Safe to call repeatedly — email_log prevents duplicates."""
+    if engine is None:
+        return
+    now = datetime.utcnow()
+    cutoff_24h = (now - timedelta(hours=24)).isoformat()
+    cutoff_72h = (now - timedelta(hours=72)).isoformat()
+    try:
+        with engine.connect() as conn:
+            # Email 2: signed up >24h ago, 0 sessions logged against their account, no 24h email yet
+            candidates_24h = conn.execute(text("""
+                SELECT a.id, a.email FROM accounts a
+                WHERE a.created_at <= :cutoff
+                AND NOT EXISTS (
+                    SELECT 1 FROM email_log el
+                    WHERE el.account_id = a.id AND el.email_type = 'onboarding_24h'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM session_history sh WHERE sh.account_id = a.id
+                )
+                LIMIT 50
+            """), {"cutoff": cutoff_24h}).fetchall()
+
+            # Email 3: signed up >72h ago, no 72h email yet; filter <3 sessions in Python
+            candidates_72h = conn.execute(text("""
+                SELECT a.id, a.email,
+                    (SELECT COUNT(*) FROM session_history sh WHERE sh.account_id = a.id) AS sess_count
+                FROM accounts a
+                WHERE a.created_at <= :cutoff
+                AND NOT EXISTS (
+                    SELECT 1 FROM email_log el
+                    WHERE el.account_id = a.id AND el.email_type = 'onboarding_72h'
+                )
+                LIMIT 50
+            """), {"cutoff": cutoff_72h}).fetchall()
+
+        for row in candidates_24h:
+            account_id, to_email = row[0], row[1]
+            email_service.send_onboarding_setup(to_email)
+            _log_onboarding_email(account_id, "onboarding_24h")
+            _track_usage(account_id, to_email, "resend_email", 1, 0.0001,
+                         json.dumps({"type": "onboarding_24h"}))
+            logger.info(f"📧 onboarding_24h sent to {to_email}")
+
+        for row in candidates_72h:
+            account_id, to_email, sess_count = row[0], row[1], int(row[2])
+            if sess_count < 3:
+                email_service.send_onboarding_checkin(to_email)
+                _track_usage(account_id, to_email, "resend_email", 1, 0.0001,
+                             json.dumps({"type": "onboarding_72h"}))
+                logger.info(f"📧 onboarding_72h sent to {to_email} ({sess_count} sessions)")
+            else:
+                logger.info(f"📧 onboarding_72h skipped: {to_email} already has {sess_count} sessions")
+            _log_onboarding_email(account_id, "onboarding_72h")
+
+    except Exception as e:
+        logger.error(f"_process_onboarding_emails error: {e}")
+        sentry_sdk.capture_exception(e)
 
 
 # ========================
@@ -772,6 +868,17 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS api_usage_user_key_idx   ON api_usage(user_key)",
         "CREATE INDEX IF NOT EXISTS api_usage_created_at_idx ON api_usage(created_at)",
         "CREATE INDEX IF NOT EXISTS api_usage_event_type_idx ON api_usage(event_type)",
+        # ── Onboarding email log ──────────────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS email_log (
+            id          SERIAL PRIMARY KEY,
+            account_id  TEXT NOT NULL,
+            email_type  TEXT NOT NULL,
+            sent_at     TEXT NOT NULL,
+            CONSTRAINT email_log_acct_type_uniq UNIQUE (account_id, email_type)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS email_log_account_idx ON email_log(account_id)",
     ]
     try:
         with engine.connect() as conn:
@@ -3437,17 +3544,29 @@ async def auth_verify_link(request: Request, data: dict):
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("SELECT email FROM accounts WHERE id = :id"),
+                text("SELECT email, last_login FROM accounts WHERE id = :id"),
                 {"id": account_id}
             ).fetchone()
         email = row[0] if row else ""
+        is_first_login = row is not None and row[1] is None
     except Exception as e:
-        logger.error(f"auth_verify_link: email lookup error: {e}")
+        logger.error(f"auth_verify_link: account lookup error: {e}")
         email = ""
+        is_first_login = False
 
     session_token = _create_auth_session(account_id, device_id)
     _backfill_account_id(account_id, email, device_id)
     _ensure_free_credits(account_id)
+
+    if is_first_login and not _has_onboarding_email_sent(account_id, "onboarding_welcome"):
+        try:
+            email_service.send_onboarding_welcome(email)
+            _log_onboarding_email(account_id, "onboarding_welcome")
+            _track_usage(account_id, email, "resend_email", 1, 0.0001,
+                         json.dumps({"type": "onboarding_welcome"}))
+            logger.info(f"📧 onboarding_welcome sent to {email}")
+        except Exception as e:
+            logger.error(f"onboarding_welcome send error: {e}")
 
     logger.info(f"✅ Auth session created: account={account_id[:8]}… device={device_id[:8] if device_id else 'none'}")
     return {
@@ -3503,13 +3622,15 @@ async def auth_verify_otp(request: Request, data: dict):
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("SELECT id FROM accounts WHERE email = :email"),
+                text("SELECT id, last_login FROM accounts WHERE email = :email"),
                 {"email": email}
             ).fetchone()
         account_id = row[0] if row else None
+        is_first_login = row is not None and row[1] is None
     except Exception as e:
         logger.error(f"auth_verify_otp: account lookup error: {e}")
         account_id = None
+        is_first_login = False
 
     if not account_id or not _verify_otp_code(code, account_id):
         raise HTTPException(status_code=401, detail={
@@ -3520,6 +3641,16 @@ async def auth_verify_otp(request: Request, data: dict):
     session_token = _create_auth_session(account_id, device_id)
     _backfill_account_id(account_id, email, device_id)
     _ensure_free_credits(account_id)
+
+    if is_first_login and not _has_onboarding_email_sent(account_id, "onboarding_welcome"):
+        try:
+            email_service.send_onboarding_welcome(email)
+            _log_onboarding_email(account_id, "onboarding_welcome")
+            _track_usage(account_id, email, "resend_email", 1, 0.0001,
+                         json.dumps({"type": "onboarding_welcome"}))
+            logger.info(f"📧 onboarding_welcome sent to {email}")
+        except Exception as e:
+            logger.error(f"onboarding_welcome send error: {e}")
 
     logger.info(f"✅ OTP auth session created: account={account_id[:8]}… device={device_id[:8] if device_id else 'none'}")
     return {
@@ -3898,6 +4029,25 @@ async def debug_prompts(request: Request):
                 })
 
     return {"count": len(results), "prompts": results}
+
+
+@app.on_event("startup")
+async def _startup_onboarding_worker():
+    """Start the background task that sends 24h and 72h onboarding emails."""
+    async def _worker():
+        # Run once immediately on startup to catch any missed sends after a restart
+        try:
+            _process_onboarding_emails()
+        except Exception as e:
+            logger.error(f"onboarding worker (startup run): {e}")
+        while True:
+            await asyncio.sleep(1800)  # check every 30 minutes
+            try:
+                _process_onboarding_emails()
+            except Exception as e:
+                logger.error(f"onboarding email worker error: {e}")
+    asyncio.create_task(_worker())
+    logger.info("✅ Onboarding email background worker started")
 
 
 if __name__ == "__main__":

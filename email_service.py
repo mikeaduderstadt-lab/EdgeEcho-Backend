@@ -407,6 +407,130 @@ def send_email_changed_confirmation(new_email: str, old_email: str) -> bool:
     return send_email(new_email, subject, _html_wrap(subject, body_html, "Open the App", _APP_URL), text)
 
 
+def send_onboarding_welcome(to: str) -> bool:
+    """
+    Email 1 of 3 in the onboarding sequence.
+    Sent immediately after first magic link or OTP verification.
+    Trigger: auth_verify_link / auth_verify_otp (first login only)
+    Status: FULLY WIRED
+    """
+    subject = "You're in. Here's how to hear it work."
+    body_html = """
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        Welcome to CerebroEcho.
+      </p>
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        The fastest way to understand what this does is to hear it.
+      </p>
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        Open the app, pick a scenario, share your meeting tab when prompted,
+        and start a real session on your next call.
+      </p>
+      <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#E8EDF2;font-weight:600;">
+        Your first session is on us.
+      </p>
+      <p style="margin:0 0 14px;font-size:14px;line-height:1.7;color:#596272;">
+        One thing worth knowing: the suggestion appears in about 2&nbsp;seconds.
+        That is not a coincidence. That is the point.
+      </p>
+      <p style="margin:0;font-size:13px;line-height:1.6;color:#596272;">
+        — The CerebroEcho team
+      </p>
+    """
+    text = (
+        "Welcome to CerebroEcho.\n\n"
+        "The fastest way to understand what this does is to hear it.\n\n"
+        "Open the app, pick a scenario, share your meeting tab when prompted, "
+        "and start a real session on your next call.\n\n"
+        "Your first session is on us.\n\n"
+        "cerebroecho.com/app\n\n"
+        "One thing worth knowing: the suggestion appears in about 2 seconds. "
+        "That is not a coincidence. That is the point.\n\n"
+        "— The CerebroEcho team"
+    )
+    return send_email(to, subject, _html_wrap(subject, body_html, "Open CerebroEcho →", _APP_URL), text)
+
+
+def send_onboarding_setup(to: str) -> bool:
+    """
+    Email 2 of 3 in the onboarding sequence.
+    Sent 24 hours after signup if session count = 0.
+    Trigger: _process_onboarding_emails() background worker
+    Status: FULLY WIRED
+    """
+    subject = "Haven't tried it yet? Here's the 3-minute setup."
+    body_html = """
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        Setting up CerebroEcho takes about 3 minutes.
+        Here&#39;s exactly what to do:
+      </p>
+      <ol style="margin:0 0 20px;padding-left:20px;font-size:15px;line-height:2.2;color:#9ba4b0;">
+        <li>Open Chrome, Edge, or Firefox on your desktop</li>
+        <li>Go to <span style="color:#7DE7FF;">cerebroecho.com/app</span></li>
+        <li>Click <span style="color:#E8EDF2;font-weight:600;">Start</span></li>
+        <li>When prompted, click <span style="color:#E8EDF2;font-weight:600;">Share Tab</span>
+            and select your meeting tab</li>
+        <li>That&#39;s it — suggestions appear as the conversation happens</li>
+      </ol>
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        No downloads. No installs.
+        Just a tab share at the start of each call.
+      </p>
+      <p style="margin:0;font-size:13px;line-height:1.6;color:#596272;">
+        If you run into anything reply to this email.
+      </p>
+    """
+    text = (
+        "Setting up CerebroEcho takes about 3 minutes. Here's exactly what to do:\n\n"
+        "1. Open Chrome, Edge, or Firefox on your desktop\n"
+        "2. Go to cerebroecho.com/app\n"
+        "3. Click Start\n"
+        "4. When prompted, click Share Tab and select your meeting tab\n"
+        "5. That's it — suggestions appear as the conversation happens\n\n"
+        "No downloads. No installs. Just a tab share at the start of each call.\n\n"
+        "cerebroecho.com/app\n\n"
+        "If you run into anything reply to this email.\n\n"
+        "— CerebroEcho"
+    )
+    return send_email(to, subject, _html_wrap(subject, body_html, "Set up in 3 minutes →", _APP_URL), text)
+
+
+def send_onboarding_checkin(to: str) -> bool:
+    """
+    Email 3 of 3 in the onboarding sequence.
+    Sent 72 hours after signup if session count < 3.
+    Trigger: _process_onboarding_emails() background worker
+    Status: FULLY WIRED
+    """
+    subject = "Did it land when you needed it?"
+    body_html = """
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        The best way to know if CerebroEcho works for you is one real call.
+      </p>
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        Not a test. Not a demo. A call where something is actually at stake.
+      </p>
+      <p style="margin:0 0 20px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        If you have one coming up — try it.<br>
+        If you haven&#39;t set it up yet — it takes 3 minutes.
+      </p>
+      <p style="margin:0;font-size:13px;line-height:1.6;color:#596272;">
+        If something didn&#39;t work or felt off, reply here.
+        We read every one.
+      </p>
+    """
+    text = (
+        "The best way to know if CerebroEcho works for you is one real call.\n\n"
+        "Not a test. Not a demo. A call where something is actually at stake.\n\n"
+        "If you have one coming up — try it.\n"
+        "If you haven't set it up yet — it takes 3 minutes.\n\n"
+        "cerebroecho.com/app\n\n"
+        "If something didn't work or felt off, reply here. We read every one.\n\n"
+        "— CerebroEcho"
+    )
+    return send_email(to, subject, _html_wrap(subject, body_html, "cerebroecho.com/app →", _APP_URL), text)
+
+
 def send_cancellation_email(to: str, ended_at: str) -> bool:
     """
     Sent when a subscription is fully cancelled (period ended or immediate cancel).
