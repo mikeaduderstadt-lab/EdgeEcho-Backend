@@ -879,6 +879,19 @@ def init_db():
         )
         """,
         "CREATE INDEX IF NOT EXISTS email_log_account_idx ON email_log(account_id)",
+        # ── Suggestion feedback ────────────────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS suggestion_feedback (
+            id              SERIAL PRIMARY KEY,
+            session_id      TEXT NOT NULL,
+            suggestion_text TEXT,
+            rating          TEXT NOT NULL,
+            reason          TEXT,
+            account_id      TEXT,
+            created_at      TIMESTAMP DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS suggestion_feedback_session_idx ON suggestion_feedback(session_id)",
     ]
     try:
         with engine.connect() as conn:
@@ -1027,6 +1040,68 @@ async def get_founder_spots():
         except Exception as e:
             logger.error(f"founder_spots error: {e}")
     return {"remaining": max(0, 50 - count), "claimed": count}
+
+
+@app.post("/send-desktop-link")
+@limiter.limit("5/minute")
+async def send_desktop_link(request: Request):
+    """Send a desktop app link email for mobile visitors."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    email = (body.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email required")
+    html = email_service._html_wrap(
+        "Open CerebroEcho on your desktop",
+        """<p style="margin:0 0 14px;font-size:15px;color:#B8C4D0;line-height:1.6;">
+           You requested a link to open CerebroEcho on your desktop browser.
+           It works best in Chrome or Edge.
+         </p>
+         <p style="margin:0;font-size:13px;color:#596272;">
+           CerebroEcho needs a desktop environment to capture audio from Zoom, Meet, or Teams.
+         </p>""",
+        cta_label="Open CerebroEcho on desktop →",
+        cta_url="https://cerebroecho.com/app",
+    )
+    text = "Open CerebroEcho on your desktop: https://cerebroecho.com/app"
+    sent = email_service.send_email(email, "Your CerebroEcho desktop link", html, text)
+    return {"ok": sent}
+
+
+@app.post("/suggestion-feedback")
+@limiter.limit("60/minute")
+async def post_suggestion_feedback(request: Request):
+    """Store thumbs up/down feedback on a suggestion card."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    session_id = (body.get("session_id") or "").strip()
+    suggestion_text = (body.get("suggestion_text") or "")[:2000]
+    rating = (body.get("rating") or "").strip()
+    reason = (body.get("reason") or "")[:200]
+    if not session_id or rating not in ("positive", "negative"):
+        raise HTTPException(status_code=400, detail="session_id and valid rating required")
+    account_id = None
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        acct, _ = _get_account_from_session(auth_header[7:].strip())
+        account_id = acct
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "INSERT INTO suggestion_feedback (session_id, suggestion_text, rating, reason, account_id) "
+                    "VALUES (:sid, :txt, :rating, :reason, :acct)"
+                ), {"sid": session_id, "txt": suggestion_text, "rating": rating,
+                    "reason": reason or None, "acct": account_id})
+                conn.commit()
+        except Exception as e:
+            logger.error(f"suggestion_feedback insert error: {e}")
+    return {"ok": True}
+
 
 @app.post("/transcribe")
 @limiter.limit(RATE_TRANSCRIBE)
