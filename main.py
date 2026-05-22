@@ -246,25 +246,52 @@ def _get_credit_balance(user_id: str) -> dict:
     return {"balance": 9999, "plan_type": "free", "total_used": 0}
 
 
-def _deduct_credits(user_id: str, cost: int) -> int:
-    """Deduct credits; returns new balance or -1 on error."""
-    if engine is None:
-        return -1
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(text("""
-                UPDATE credits
-                SET balance   = GREATEST(0, balance - :cost),
-                    total_used = total_used + :cost
-                WHERE user_id = :uid
-                RETURNING balance
-            """), {"cost": cost, "uid": user_id}).fetchone()
-            conn.commit()
-        return result[0] if result else -1
-    except Exception as e:
-        logger.error(f"_deduct_credits error: {e}")
-        sentry_sdk.capture_exception(e)
-        return -1
+def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_key: str = None) -> int:
+    with engine.begin() as conn:
+        # Check idempotency — if this key was already processed, return current balance
+        if idempotency_key:
+            existing = conn.execute(text("""
+                SELECT balance_after FROM credit_ledger
+                WHERE idempotency_key = :key
+            """), {"key": idempotency_key}).fetchone()
+            if existing:
+                return existing[0]
+
+        # Lock the row — no other request can touch this user's balance until we commit
+        result = conn.execute(text("""
+            SELECT balance FROM credits
+            WHERE user_id = :uid
+            FOR UPDATE
+        """), {"uid": user_id}).fetchone()
+
+        if not result:
+            return 0
+
+        current_balance = result[0]
+        new_balance = max(0, current_balance - cost)
+
+        # Update the balance
+        conn.execute(text("""
+            UPDATE credits
+            SET balance = :new_balance,
+                total_used = total_used + :cost
+            WHERE user_id = :uid
+        """), {"new_balance": new_balance, "cost": cost, "uid": user_id})
+
+        # Write immutable ledger entry
+        conn.execute(text("""
+            INSERT INTO credit_ledger
+            (user_id, amount, balance_after, operation_type, feature, idempotency_key)
+            VALUES (:uid, :amount, :balance_after, 'usage', :feature, :key)
+        """), {
+            "uid": user_id,
+            "amount": -cost,
+            "balance_after": new_balance,
+            "feature": feature,
+            "key": idempotency_key
+        })
+
+        return new_balance
 
 
 def _track_usage(user_key: str, user_email: str, event_type: str, units: float, estimated_cost_usd: float, metadata: str | None = None) -> None:
@@ -1026,13 +1053,6 @@ async def health():
             t0 = time.time()
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
-                tables_row = conn.execute(text("""
-                    SELECT array_agg(table_name ORDER BY table_name)
-                    FROM information_schema.tables
-                    WHERE table_schema = 'public'
-                      AND table_name IN ('credit_ledger', 'usage_events')
-                """)).fetchone()
-                checks["new_tables"] = tables_row[0] if tables_row else []
             checks["db_latency_ms"] = round((time.time() - t0) * 1000, 1)
             db_ok = True
         except Exception as e:
