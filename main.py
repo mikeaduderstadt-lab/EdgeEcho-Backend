@@ -2059,19 +2059,10 @@ async def brief_url(request: Request, data: dict):
     _save_ctx_cache(user_id, brief_text)
 
     # Step 3 — Deduct credits
-    if engine is not None:
-        try:
-            with engine.connect() as conn:
-                conn.execute(text("""
-                    INSERT INTO credits (user_id, balance, plan_type, total_used)
-                    VALUES (:uid, :neg_cost, 'free', :cost)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        balance = credits.balance - :cost,
-                        total_used = credits.total_used + :cost
-                """), {"uid": user_id, "cost": credits_cost, "neg_cost": -credits_cost})
-                conn.commit()
-        except Exception as e:
-            logger.error(f"Credits deduction error: {e}")
+    idem_key = hashlib.sha256(
+        f"{user_id}:{url}:{tier}:{int(time.time() // 10)}".encode()
+    ).hexdigest()
+    _deduct_credits(user_id, credits_cost, feature=f"briefing:{tier}", idempotency_key=idem_key)
 
     logger.info(f"🔍 {tier} brief for {url} ({len(brief_text)} chars), {credits_cost} credits deducted")
     return {
