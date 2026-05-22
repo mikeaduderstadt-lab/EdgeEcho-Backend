@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import logging
+import hashlib
 import urllib.parse
 from datetime import datetime, timedelta
 import stripe
@@ -1370,7 +1371,10 @@ async def coach(
         logger.info(f"✅ Full answer text ({len(answer)} chars): {answer[:100]}...")
         _track_usage(user_key, userEmail, "groq_llm",
                      len(answer), len(answer) / 4 * 0.0000008)
-        credits_remaining = _deduct_credits(user_key, cost)
+        idem_key = hashlib.sha256(
+            f"{user_key}:{transcript[:200]}:{int(time.time() // 10)}".encode()
+        ).hexdigest()
+        credits_remaining = _deduct_credits(user_key, cost, feature=f"coach:{style}", idempotency_key=idem_key)
         if credits_remaining < 0:
             credits_remaining = max(0, credits["balance"] - cost)
         processing_time = time.time() - start_time
