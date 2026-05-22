@@ -1054,20 +1054,6 @@ async def health():
             t0 = time.time()
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
-                ledger_rows = conn.execute(text("""
-                    SELECT id, user_id, amount, balance_after, operation_type, feature,
-                           idempotency_key, created_at
-                    FROM credit_ledger
-                    ORDER BY created_at DESC
-                    LIMIT 5
-                """)).fetchall()
-                checks["ledger_recent"] = [
-                    {"id": r[0], "user_id": r[1][:12]+"…", "amount": r[2],
-                     "balance_after": r[3], "operation_type": r[4], "feature": r[5],
-                     "idempotency_key": r[6][:16]+"…" if r[6] else None,
-                     "created_at": str(r[7])}
-                    for r in ledger_rows
-                ]
             checks["db_latency_ms"] = round((time.time() - t0) * 1000, 1)
             db_ok = True
         except Exception as e:
