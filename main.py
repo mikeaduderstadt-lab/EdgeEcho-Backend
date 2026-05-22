@@ -892,6 +892,41 @@ def init_db():
         )
         """,
         "CREATE INDEX IF NOT EXISTS suggestion_feedback_session_idx ON suggestion_feedback(session_id)",
+        """
+        CREATE TABLE IF NOT EXISTS credit_ledger (
+            id               BIGSERIAL PRIMARY KEY,
+            user_id          TEXT NOT NULL,
+            amount           INTEGER NOT NULL,
+            balance_after    INTEGER NOT NULL,
+            operation_type   TEXT NOT NULL,
+            feature          TEXT,
+            idempotency_key  TEXT UNIQUE,
+            created_at       TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_credit_ledger_user
+        ON credit_ledger(user_id, created_at DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS usage_events (
+            id               BIGSERIAL PRIMARY KEY,
+            user_id          TEXT NOT NULL,
+            feature          TEXT NOT NULL,
+            provider         TEXT NOT NULL,
+            input_units      NUMERIC,
+            output_units     NUMERIC,
+            raw_cost_usd     NUMERIC(10,6),
+            credits_charged  INTEGER,
+            status           TEXT NOT NULL,
+            idempotency_key  TEXT,
+            created_at       TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_usage_events_user
+        ON usage_events(user_id, created_at DESC)
+        """,
     ]
     try:
         with engine.connect() as conn:
