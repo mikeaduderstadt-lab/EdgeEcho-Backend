@@ -1026,6 +1026,13 @@ async def health():
             t0 = time.time()
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
+                tables_row = conn.execute(text("""
+                    SELECT array_agg(table_name ORDER BY table_name)
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name IN ('credit_ledger', 'usage_events')
+                """)).fetchone()
+                checks["new_tables"] = tables_row[0] if tables_row else []
             checks["db_latency_ms"] = round((time.time() - t0) * 1000, 1)
             db_ok = True
         except Exception as e:
