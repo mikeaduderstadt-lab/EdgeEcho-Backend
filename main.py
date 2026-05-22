@@ -1,4 +1,4 @@
-﻿import io
+import io
 import os
 import json
 import tempfile
@@ -15,7 +15,6 @@ from deepgram import DeepgramClient
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
-import openai
 from groq import Groq
 from cartesia import Cartesia
 from dotenv import load_dotenv
@@ -151,18 +150,6 @@ try:
 except Exception as e:
     logger.error(f"❌ ERROR creating Groq client: {e}")
     client = None
-
-openai_client = None
-try:
-    openai_api_key = os.environ.get("OPENAI_API_KEY")
-    if not openai_api_key:
-        logger.warning("⚠️ OPENAI_API_KEY not set")
-    else:
-        openai_client = openai.OpenAI(api_key=openai_api_key)
-        logger.info("✅ OpenAI client initialized successfully")
-except Exception as e:
-    logger.error(f"❌ ERROR creating OpenAI client: {e}")
-    openai_client = None
 
 cartesia_client = None
 try:
@@ -1043,7 +1030,7 @@ async def health():
     503 when any critical dependency is degraded.
 
     Critical (affect HTTP status): db, groq, deepgram
-    Non-critical (informational only): openai, cartesia, stripe, resend
+    Non-critical (informational only): cartesia, stripe, resend
     """
     checks: dict = {}
 
@@ -1064,8 +1051,7 @@ async def health():
     # ── SDK clients (initialised at startup) ─────────────────────────────
     groq_ok     = client is not None
     deepgram_ok = deepgram_client is not None
-    # TTS is available when either Cartesia or OpenAI is initialised
-    tts_ok      = cartesia_client is not None or openai_client is not None
+    tts_ok      = cartesia_client is not None
 
     # ── API key presence (never expose values) ────────────────────────────
     checks.update({
@@ -1074,7 +1060,6 @@ async def health():
         "deepgram":    deepgram_ok,
         "tts":         tts_ok,
         "cartesia":    cartesia_client is not None,
-        "openai":      openai_client is not None,
         "stripe":      bool(os.getenv("STRIPE_SECRET_KEY")),
         "resend":      bool(os.getenv("RESEND_API_KEY")),
     })
@@ -1404,250 +1389,6 @@ async def coach(
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 
-@app.post("/process_audio")
-@limiter.limit(RATE_TRANSCRIBE)
-async def process_audio(
-    request: Request,
-    audio: UploadFile = File(None),
-    file: UploadFile = File(None),
-    deviceId: str = Form(...),
-    userEmail: str = Form("anonymous"),
-    context: str = Form("a professional role"),
-    work_history: str = Form(""),
-    style: str = Form("script")
-):
-    # Check if Groq is available
-    if client is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="AI service unavailable - check server configuration"
-        )
-    
-    # Get the actual file
-    actual_file = audio or file
-    if not actual_file:
-        raise HTTPException(status_code=400, detail="No audio file provided")
-    
-    # Legacy endpoint — credits are the gate now; usage_tracker kept for reference only
-    user_key = f"{deviceId}_{userEmail}"
-    
-    temp_filename = None
-    
-    try:
-        start_time = time.time()
-        
-        # Read audio content
-        content = await actual_file.read()
-        
-        # Reject tiny files (likely noise or empty clicks)
-        if len(content) < 1000:
-            logger.warning(f"⚠️ Audio too small: {len(content)} bytes")
-            return {
-                "answer": "Listening...",
-                "transcript": "",
-                "questions_used": current_used,
-                "processing_time": round(time.time() - start_time, 3)
-            }
-        
-        logger.info(f"📝 Transcribing {len(content)} bytes...")
-
-        # AUDIO RETENTION: temp file exists only for the duration of the Groq API call.
-        # Raw audio bytes are never written to database or object storage.
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
-            temp_file.write(content)
-            temp_filename = temp_file.name
-
-        with open(temp_filename, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                file=(temp_filename, audio_file.read(), "audio/webm"),
-                model="whisper-large-v3-turbo",
-                response_format="text",
-            )
-        
-        # Clean up temp file
-        if temp_filename and os.path.exists(temp_filename):
-            os.unlink(temp_filename)
-            temp_filename = None
-        
-        transcript = transcription.strip() if transcription else ""
-        
-        if not transcript or len(transcript) < 2:
-            return {
-                "answer": "Listening...",
-                "transcript": "",
-                "questions_used": current_used,
-                "processing_time": round(time.time() - start_time, 3)
-            }
-        
-        logger.info(f"✅ Transcript: {transcript[:50]}...")
-        
-        # Generate answer based on style
-        if style == "shorthand":
-            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-Their background: {work_history}
-Provide ONE hint or framework name only. Max 10 words."""
-            max_tokens = 50
-        elif style == "bullet":
-            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-Their background: {work_history}
-Provide 3 tactical bullet points. Max 100 words total."""
-            max_tokens = 200
-        else:
-            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-Their background: {work_history}
-Provide a 2-3 sentence tactical answer. Be concise and confident."""
-            max_tokens = 150
-        
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Interview question: {transcript}"}
-            ],
-            temperature=0.6,
-            max_tokens=max_tokens,
-            top_p=0.9
-        )
-        
-        answer = completion.choices[0].message.content.strip()
-        usage_tracker[user_key] = current_used + 1
-        processing_time = time.time() - start_time
-        
-        logger.info(f"✅ Answer generated in {processing_time:.2f}s")
-        logger.info(f"[AUDIO PROCESSED] Device: {deviceId} | Q: {transcript[:50]}... | Time: {processing_time:.3f}s")
-        
-        return {
-            "transcript": transcript,
-            "answer": answer,
-            "questions_used": usage_tracker[user_key],
-            "processing_time": round(processing_time, 3)
-        }
-        
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        logger.error(f"❌ ERROR: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-
-        # Cleanup on error
-        if temp_filename and os.path.exists(temp_filename):
-            os.unlink(temp_filename)
-
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
-
-@app.post("/process_and_speak")
-@limiter.limit(RATE_TRANSCRIBE)
-async def process_and_speak(
-    request: Request,
-    audio: UploadFile = File(None),
-    file: UploadFile = File(None),
-    deviceId: str = Form(...),
-    userEmail: str = Form("anonymous"),
-    context: str = Form("a professional role"),
-    work_history: str = Form(""),
-    style: str = Form("script"),
-    voice: str = Form("onyx"),
-):
-    """Unified endpoint: STT + LLM + TTS in one request, streams audio directly."""
-    if client is None:
-        raise HTTPException(status_code=503, detail="AI service unavailable")
-    if cartesia_client is None:
-        raise HTTPException(status_code=503, detail="TTS service unavailable")
-
-    actual_file = audio or file
-    if not actual_file:
-        raise HTTPException(status_code=400, detail="No audio file provided")
-
-    # Legacy endpoint — credits are the gate now
-    temp_filename = None
-    try:
-        start_time = time.time()
-        content = await actual_file.read()
-
-        if len(content) < 1000:
-            raise HTTPException(status_code=400, detail="Audio too short")
-
-        # AUDIO RETENTION: temp file used only for Groq API call; deleted immediately after.
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
-            temp_file.write(content)
-            temp_filename = temp_file.name
-
-        with open(temp_filename, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                file=(temp_filename, audio_file.read(), "audio/webm"),
-                model="whisper-large-v3-turbo",
-                response_format="text",
-            )
-
-        if temp_filename and os.path.exists(temp_filename):
-            os.unlink(temp_filename)
-            temp_filename = None
-
-        transcript = transcription.strip() if transcription else ""
-        if not transcript or len(transcript) < 2:
-            raise HTTPException(status_code=400, detail="No speech detected")
-
-        if style == "shorthand":
-            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-Their background: {work_history}
-Provide ONE hint or framework name only. Max 10 words."""
-            max_tokens = 50
-        elif style == "bullet":
-            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-Their background: {work_history}
-Provide 3 tactical bullet points. Max 100 words total."""
-            max_tokens = 200
-        else:
-            system_prompt = f"""You are an elite interview coach. The candidate is interviewing for {context}.
-Their background: {work_history}
-Provide a 2-3 sentence tactical answer. Be concise and confident."""
-            max_tokens = 150
-
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Interview question: {transcript}"}
-            ],
-            temperature=0.6,
-            max_tokens=max_tokens,
-            top_p=0.9
-        )
-
-        answer = completion.choices[0].message.content.strip()
-        usage_tracker[user_key] = current_used + 1
-        logger.info(f"✅ STT+LLM done in {time.time() - start_time:.2f}s, starting TTS stream")
-
-        voice_id = CARTESIA_VOICE_MAP.get(voice, CARTESIA_VOICE_MAP["onyx"])
-
-        def generate():
-            for chunk in cartesia_client.tts.sse(
-                model_id="sonic-2",
-                transcript=answer[:300],
-                voice={"mode": "id", "id": voice_id},
-                output_format={"container": "mp3", "bit_rate": 128000, "sample_rate": 44100},
-            ):
-                yield chunk.audio
-
-        return StreamingResponse(
-            generate(),
-            media_type="audio/mpeg",
-            headers={
-                "X-Transcript": urllib.parse.quote(transcript[:200]),
-                "X-Answer": urllib.parse.quote(answer[:300]),
-                "X-Questions-Used": str(usage_tracker[user_key]),
-            }
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ process_and_speak ERROR: {e}")
-        if temp_filename and os.path.exists(temp_filename):
-            os.unlink(temp_filename)
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
-
-
 @app.post("/tts")
 @limiter.limit(RATE_TTS)
 async def text_to_speech(request: Request, data: dict):
@@ -1701,26 +1442,9 @@ async def text_to_speech(request: Request, data: dict):
                      len(text), len(text) * 0.000015)
         return StreamingResponse(cartesia_stream(), media_type="audio/mpeg")
 
-    # Fallback: OpenAI TTS (sync client — runs in executor to avoid blocking event loop)
-    if openai_client is None:
-        raise HTTPException(status_code=503, detail="TTS service unavailable: neither CARTESIA_API_KEY nor OPENAI_API_KEY is set")
-    voice = data.get("voice", "onyx")
-    logger.warning("⚠️ USING OPENAI FALLBACK — CARTESIA_API_KEY not set")
-    try:
-        def _openai_gen():
-            with openai_client.audio.speech.with_streaming_response.create(
-                model="tts-1", voice=voice, input=text, speed=speed,
-            ) as response:
-                yield from response.iter_bytes(chunk_size=4096)
-
-        _track_usage(_tts_user_key, data.get("userEmail", ""), "openai_tts_fallback",
-                     len(text), len(text) * 0.000015)
-        return StreamingResponse(_openai_gen(), media_type="audio/mpeg")
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        import traceback
-        logger.error(f"TTS fallback error: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
+    # Cartesia unavailable — return text-only; client handles graceful degradation
+    logger.warning("⚠️ TTS unavailable: CARTESIA_API_KEY not set")
+    raise HTTPException(status_code=503, detail="TTS service unavailable")
 
 @app.post("/session/start")
 @limiter.limit(RATE_READS)
@@ -1832,10 +1556,24 @@ async def quick_transcribe(
     request: Request,
     audio: UploadFile = File(None),
     file: UploadFile = File(None),
+    deviceId: str = Form(""),
+    userEmail: str = Form("anonymous"),
 ):
     """Fast STT-only endpoint for question continuation detection."""
     if client is None:
         raise HTTPException(status_code=503, detail="STT service unavailable")
+
+    # Auth gate — caller must have a credits row with non-zero balance
+    try:
+        raw_user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+        user_key = _get_credits_user_id(raw_user_id, account_id)
+        if _deduct_credits(user_key, 0) == 0:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     actual_file = audio or file
     if not actual_file:
         raise HTTPException(status_code=400, detail="No audio file provided")
