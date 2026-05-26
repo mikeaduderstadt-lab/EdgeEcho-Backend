@@ -343,7 +343,8 @@ def reset_expired_credits():
                 new_reset = (datetime.utcnow() + timedelta(days=30)).isoformat()
                 conn.execute(text("""
                     UPDATE credits
-                    SET balance = :bal, reset_date = :reset, total_used = 0
+                    SET balance = :bal, reset_date = :reset, total_used = 0,
+                        audio_seconds_used = 0
                     WHERE user_id = :uid
                 """), {"bal": new_bal, "reset": new_reset, "uid": uid})
             if rows:
@@ -1251,6 +1252,29 @@ async def coach(
             if len(content) < 1000:
                 return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "tts_allowed": tts_allowed, "processing_time": round(time.time() - start_time, 3)}
 
+            # ── Solo plan audio hard cap: 3600 seconds (1 hour) per month ──
+            if plan_type == "solo" and engine is not None:
+                try:
+                    with engine.connect() as _conn:
+                        _row = _conn.execute(
+                            text("SELECT audio_seconds_used FROM credits WHERE user_id=:uid"),
+                            {"uid": user_key}
+                        ).fetchone()
+                    _audio_used = _row[0] if _row else 0
+                except Exception as _e:
+                    logger.error(f"audio cap read error: {_e}")
+                    _audio_used = 0
+                if _audio_used >= 3600:
+                    return {
+                        "answer": "Monthly audio limit reached. Upgrade to Pro for unlimited audio.",
+                        "transcript": "",
+                        "credits_remaining": credits["balance"],
+                        "tts_allowed": tts_allowed,
+                        "processing_time": round(time.time() - start_time, 3),
+                        "audio_cap_reached": True,
+                        "message": "Monthly audio limit reached. Upgrade to Pro for unlimited audio.",
+                    }
+
             logger.info(f"📝 Transcribing {len(content)} bytes via Whisper...")
             # AUDIO RETENTION: temp file required by Groq file API (cannot stream bytes directly).
             # Written to OS temp dir, read once for transcription, then immediately deleted.
@@ -1274,6 +1298,20 @@ async def coach(
             transcript = transcription.strip() if transcription else ""
             _track_usage(user_key, userEmail, "whisper_transcription",
                          len(content), len(content) / 16000 / 2 * 0.0001)
+
+            # ── Solo plan: increment audio seconds consumed ──
+            # WebM/Opus from browser MediaRecorder at ~128 kbps → ~16000 bytes/sec
+            if plan_type == "solo" and engine is not None:
+                _audio_secs = max(1, round(len(content) / 16000))
+                try:
+                    with engine.begin() as _conn:
+                        _conn.execute(text("""
+                            UPDATE credits
+                            SET audio_seconds_used = audio_seconds_used + :secs
+                            WHERE user_id = :uid
+                        """), {"secs": _audio_secs, "uid": user_key})
+                except Exception as _e:
+                    logger.error(f"audio_seconds increment error: {_e}")
             if not transcript or len(transcript) < 2:
                 return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "tts_allowed": tts_allowed, "processing_time": round(time.time() - start_time, 3)}
 
