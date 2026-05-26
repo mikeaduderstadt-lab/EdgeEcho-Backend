@@ -1398,7 +1398,15 @@ async def text_to_speech(request: Request, data: dict):
 
     speed    = float(data.get("speed", 0.85))
     voice_id = data.get("voice_id", "f9836c6e-a0bd-460e-9d3c-f7299fa60f94")
-    _tts_user_key, _, _ = _resolve_user(request, data.get("deviceId", ""), data.get("userEmail", ""))
+    _tts_user_id, _tts_account_id, _ = _resolve_user(request, data.get("deviceId", ""), data.get("userEmail", ""))
+    _tts_user_key = _get_credits_user_id(_tts_user_id, _tts_account_id)
+    plan_info = _get_credit_balance(_tts_user_key)
+    if plan_info["plan_type"] not in TTS_ALLOWED_PLANS:
+        raise HTTPException(status_code=403, detail={
+            "code": "PLAN_REQUIRED",
+            "message": "TTS audio requires Pro plan or above.",
+            "required_plan": "pro",
+        })
 
     cartesia_api_key = os.environ.get("CARTESIA_API_KEY")
     if cartesia_api_key:
