@@ -203,12 +203,12 @@ except Exception as e:
 # CREDIT SYSTEM
 # ========================
 PLAN_CREDITS = {
-    "free":        30,      # one-time, never resets
-    "echo":        400,     # monthly  ← STRIPE_PRICE_ECHO
-    "pro":         1000,    # monthly  ← STRIPE_PRICE_PRO
-    "command":     2500,    # monthly  ← STRIPE_PRICE_COMMAND
-    "operator":    6000,    # monthly  ← STRIPE_PRICE_OPERATOR
-    "founding_50": 1000,    # one-time ← STRIPE_PRICE_FOUNDING50
+    "free":        60,      # one-time, never resets
+    "echo":        600,     # Solo $9.99/mo  ← STRIPE_PRICE_ECHO
+    "pro":         7000,    # Pro $19.99/mo  ← STRIPE_PRICE_PRO
+    "command":     14000,   # Power $39.99/mo ← STRIPE_PRICE_COMMAND
+    "operator":    14000,   # Operator tier  ← STRIPE_PRICE_OPERATOR
+    "founding_50": 14000,   # LTD $299       ← STRIPE_PRICE_FOUNDING50
 }
 
 STYLE_COSTS = {
@@ -231,7 +231,7 @@ def _get_credit_balance(user_id: str) -> dict:
         with engine.connect() as conn:
             conn.execute(text("""
                 INSERT INTO credits (user_id, balance, plan_type, total_used)
-                VALUES (:uid, 30, 'free', 0)
+                VALUES (:uid, 60, 'free', 0)
                 ON CONFLICT (user_id) DO NOTHING
             """), {"uid": user_id})
             conn.commit()
