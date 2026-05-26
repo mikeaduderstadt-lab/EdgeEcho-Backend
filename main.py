@@ -96,6 +96,19 @@ app.add_middleware(
     expose_headers=["X-Transcript", "X-Answer", "X-Questions-Used"],
 )
 
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
+
 # ========================
 # RATE LIMITING
 # ========================
@@ -190,12 +203,12 @@ except Exception as e:
 # CREDIT SYSTEM
 # ========================
 PLAN_CREDITS = {
-    "free":        60,      # one-time, never resets
-    "solo":        600,     # monthly
-    "pro":         7000,    # monthly
-    "power":       14000,   # monthly
-    "founding_50": 14000,   # monthly
-    "ltd":         14000,   # one-time (lifetime deal)
+    "free":        30,      # one-time, never resets
+    "echo":        400,     # monthly  ← STRIPE_PRICE_ECHO
+    "pro":         1000,    # monthly  ← STRIPE_PRICE_PRO
+    "command":     2500,    # monthly  ← STRIPE_PRICE_COMMAND
+    "operator":    6000,    # monthly  ← STRIPE_PRICE_OPERATOR
+    "founding_50": 1000,    # one-time ← STRIPE_PRICE_FOUNDING50
 }
 
 STYLE_COSTS = {
@@ -957,10 +970,14 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_usage_events_user
         ON usage_events(user_id, created_at DESC)
         """,
-        # ── Solo plan audio hard-cap tracking ─────────────────────────────────
+        # ── Echo plan audio hard-cap tracking ─────────────────────────────────
         "ALTER TABLE credits ADD COLUMN IF NOT EXISTS audio_seconds_used INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE credits ADD COLUMN IF NOT EXISTS audio_seconds_reset_date DATE",
         "ALTER TABLE credits ADD COLUMN IF NOT EXISTS payg_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+        # ── Performance indexes for account_id lookups ────────────────────────
+        "CREATE INDEX IF NOT EXISTS credits_account_id_idx ON credits(account_id)",
+        "CREATE INDEX IF NOT EXISTS session_history_account_id_idx ON session_history(account_id)",
+        "CREATE INDEX IF NOT EXISTS preferences_account_id_idx ON preferences(account_id)",
     ]
     try:
         with engine.connect() as conn:
@@ -1267,8 +1284,8 @@ async def coach(
             if len(content) < 1000:
                 return {"answer": "Listening...", "transcript": "", "credits_remaining": credits["balance"], "tts_allowed": tts_allowed, "processing_time": round(time.time() - start_time, 3)}
 
-            # ── Solo plan audio hard cap: 3600 seconds (1 hour) per month ──
-            if plan_type == "solo" and engine is not None:
+            # ── Echo plan audio hard cap: 3600 seconds (1 hour) per month ──
+            if plan_type == "echo" and engine is not None:
                 try:
                     with engine.connect() as _conn:
                         _row = _conn.execute(
@@ -1314,9 +1331,9 @@ async def coach(
             _track_usage(user_key, userEmail, "whisper_transcription",
                          len(content), len(content) / 16000 / 2 * 0.0001)
 
-            # ── Solo plan: increment audio seconds consumed ──
+            # ── Echo plan: increment audio seconds consumed ──
             # WebM/Opus from browser MediaRecorder at ~128 kbps → ~16000 bytes/sec
-            if plan_type == "solo" and engine is not None:
+            if plan_type == "echo" and engine is not None:
                 _audio_secs = max(1, round(len(content) / 16000))
                 try:
                     with engine.begin() as _conn:
@@ -1763,6 +1780,10 @@ async def brief_url(request: Request, data: dict):
 
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    if any(blocked in url.lower() for blocked in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.", "10.", "192.168.", "172.16.")):
+        raise HTTPException(status_code=400, detail="That URL is not publicly accessible.")
 
     # Plan gate: Command+ only — use _resolve_user for cross-device consistency
     user_id, account_id, _ = _resolve_user(request, device_id, user_email)
@@ -3048,6 +3069,8 @@ async def stripe_webhook(request: Request):
                                 f"🚫 invoice.payment_failed: grace period exceeded — "
                                 f"downgraded {uid} (was {failed_plan}) after {fail_count} failures"
                             )
+                            to_email_dng = uid.split("_", 1)[1] if "_" in uid else ""
+                            email_service.send_downgrade_email(to_email_dng, failed_plan)
                         conn.commit()
 
                     next_str = (

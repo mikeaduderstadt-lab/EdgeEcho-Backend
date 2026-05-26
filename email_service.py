@@ -84,6 +84,8 @@ def _html_wrap(heading: str, body_html: str, cta_label: str = "", cta_url: str =
           </p>
           <p style="margin:5px 0 0;font-size:11px;color:#596272;">
             You're receiving this because you have an account at CerebroEcho.
+            To stop receiving emails, delete your account at
+            <a href="https://cerebroecho.com/app/settings" style="color:#596272;text-decoration:underline;">cerebroecho.com/app/settings</a>.
           </p>
         </td></tr>
 
@@ -108,11 +110,12 @@ def _send_via_resend(to: str, subject: str, html: str, text: str) -> bool:
         import resend  # lazy import: missing package only fails on first send attempt
         resend.api_key = api_key
         result = resend.Emails.send({
-            "from":    os.environ.get("EMAIL_FROM_ADDRESS", _FROM_DEFAULT),
-            "to":      [to],
-            "subject": subject,
-            "html":    html,
-            "text":    text,
+            "from":     os.environ.get("EMAIL_FROM_ADDRESS", _FROM_DEFAULT),
+            "reply_to": os.environ.get("EMAIL_REPLY_TO", "support@cerebroecho.com"),
+            "to":       [to],
+            "subject":  subject,
+            "html":     html,
+            "text":     text,
         })
         email_id = result.get("id", "unknown") if isinstance(result, dict) else getattr(result, "id", "unknown")
         logger.info(f"✅ Email sent via Resend: id={email_id} to={to!r} subject={subject!r}")
@@ -529,6 +532,39 @@ def send_onboarding_checkin(to: str) -> bool:
         "— CerebroEcho"
     )
     return send_email(to, subject, _html_wrap(subject, body_html, "cerebroecho.com/app →", _APP_URL), text)
+
+
+def send_downgrade_email(to: str, previous_plan: str) -> bool:
+    """
+    Sent when a user's plan is automatically downgraded to free after 3 failed payments.
+    Trigger: invoice.payment_failed webhook (after MAX_PAYMENT_FAILURES reached)
+    Status: FULLY WIRED
+    """
+    plan_display = previous_plan.replace("_", " ").title()
+    subject = "Your CerebroEcho plan has been downgraded"
+    body_html = f"""
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        After multiple failed payment attempts, your
+        <span style="color:#E8EDF2;font-weight:600;">{plan_display}</span>
+        subscription has been cancelled and your account moved to the free plan.
+      </p>
+      <p style="margin:0 0 14px;font-size:15px;line-height:1.7;color:#9ba4b0;">
+        Your session history and preferences are still saved.
+        Update your payment method and re-subscribe anytime to restore your plan.
+      </p>
+      <p style="margin:0;font-size:13px;line-height:1.6;color:#596272;">
+        Questions? Reply to this email or contact
+        <a href="mailto:support@cerebroecho.com" style="color:#596272;">support@cerebroecho.com</a>.
+      </p>
+    """
+    text = (
+        f"Your {plan_display} subscription has been cancelled after multiple failed payment attempts.\n\n"
+        "Your account is now on the free plan. Your session history and preferences are still saved.\n\n"
+        "Re-subscribe at cerebroecho.com/app to restore your plan.\n\n"
+        "Questions? Contact support@cerebroecho.com\n\n"
+        "— CerebroEcho"
+    )
+    return send_email(to, subject, _html_wrap(subject, body_html, "Re-subscribe", _APP_URL), text)
 
 
 def send_cancellation_email(to: str, ended_at: str) -> bool:
