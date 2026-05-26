@@ -190,12 +190,12 @@ except Exception as e:
 # CREDIT SYSTEM
 # ========================
 PLAN_CREDITS = {
-    "free":        30,     # one-time, never resets
-    "echo":        400,    # monthly
-    "pro":         1000,   # monthly
-    "command":     2500,   # monthly
-    "operator":    6000,   # monthly
-    "founding_50": 1000,   # monthly
+    "free":        60,      # one-time, never resets
+    "solo":        600,     # monthly
+    "pro":         7000,    # monthly
+    "power":       14000,   # monthly
+    "founding_50": 14000,   # monthly
+    "ltd":         14000,   # one-time (lifetime deal)
 }
 
 STYLE_COSTS = {
