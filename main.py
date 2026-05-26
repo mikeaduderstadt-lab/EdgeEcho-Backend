@@ -339,7 +339,7 @@ def reset_expired_credits():
                 WHERE reset_date IS NOT NULL AND reset_date <= :now
             """), {"now": now}).fetchall()
             for uid, plan in rows:
-                new_bal = PLAN_CREDITS.get(plan, 30)
+                new_bal = PLAN_CREDITS.get(plan, PLAN_CREDITS["free"])
                 new_reset = (datetime.utcnow() + timedelta(days=30)).isoformat()
                 conn.execute(text("""
                     UPDATE credits
@@ -942,6 +942,9 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_usage_events_user
         ON usage_events(user_id, created_at DESC)
         """,
+        # ── Solo plan audio hard-cap tracking ─────────────────────────────────
+        "ALTER TABLE credits ADD COLUMN IF NOT EXISTS audio_seconds_used INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE credits ADD COLUMN IF NOT EXISTS audio_seconds_reset_date DATE",
     ]
     try:
         with engine.connect() as conn:
