@@ -1393,9 +1393,24 @@ async def coach(
         logger.info(f"🧠 Role={role} | Mode={mode} | Style={style} | ctx={len(effective_session_context)}c | prefs={len(user_preferences)}c | max_tokens={max_tokens}")
         logger.info(f"📋 SYSTEM PROMPT [{role}/{mode}/{style}]:\n{'─'*60}\n{system_prompt}\n{'─'*60}")
 
-        # Build messages with full session history as conversation turns
+        # Hybrid context: last 10 turns full + older turns as compressed cliff notes
+        FULL_TURNS = 10
+        recent = history[-FULL_TURNS:]
+        older  = history[:-FULL_TURNS] if len(history) > FULL_TURNS else []
+
+        def _clip(text, n):
+            t = (text or "").strip()
+            return t[:n] + ("…" if len(t) > n else "")
+
+        if older:
+            notes = "\n".join(
+                f"• {_clip(t.get('question',''), 50)} → {_clip(t.get('answer',''), 80)}"
+                for t in older
+            )
+            system_prompt = system_prompt + f"\n\n[Earlier this session ({len(older)} exchanges):\n{notes}\n]"
+
         messages = [{"role": "system", "content": system_prompt}]
-        for turn in history:
+        for turn in recent:
             messages.append({"role": "user", "content": f"Interview question: {turn['question']}"})
             messages.append({"role": "assistant", "content": turn['answer']})
         messages.append({"role": "user", "content": f"Interview question: {transcript}"})
