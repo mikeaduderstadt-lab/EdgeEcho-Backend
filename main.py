@@ -859,6 +859,7 @@ def init_db():
         # Nullable account_id on existing tables — completely additive, zero downtime
         "ALTER TABLE credits          ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS account_id TEXT",
+        "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS full_transcript TEXT",
         "ALTER TABLE preferences      ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE stripe_customers ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE founding_members ADD COLUMN IF NOT EXISTS account_id TEXT",
@@ -1392,9 +1393,9 @@ async def coach(
         logger.info(f"🧠 Role={role} | Mode={mode} | Style={style} | ctx={len(effective_session_context)}c | prefs={len(user_preferences)}c | max_tokens={max_tokens}")
         logger.info(f"📋 SYSTEM PROMPT [{role}/{mode}/{style}]:\n{'─'*60}\n{system_prompt}\n{'─'*60}")
 
-        # Build messages with rolling session history as conversation turns
+        # Build messages with full session history as conversation turns
         messages = [{"role": "system", "content": system_prompt}]
-        for turn in history[-5:]:
+        for turn in history:
             messages.append({"role": "user", "content": f"Interview question: {turn['question']}"})
             messages.append({"role": "assistant", "content": turn['answer']})
         messages.append({"role": "user", "content": f"Interview question: {transcript}"})
@@ -1950,6 +1951,7 @@ async def end_session(request: Request, data: dict):
     transcript = data.get("transcript", [])
     duration_seconds = int(data.get("duration_seconds", 0))
     ghost_mode = bool(data.get("ghost_mode", False))
+    save_memory = bool(data.get("save_memory", False))
 
     # Ghost mode: wipe in-memory traces and store nothing
     if ghost_mode:
@@ -1968,7 +1970,36 @@ async def end_session(request: Request, data: dict):
     can_summarize = plan_info["plan_type"] in SUMMARY_ALLOWED_PLANS
 
     summary = f"Session with {len(transcript)} exchanges."
-    if client is not None and can_summarize:
+    full_transcript_json = None
+
+    if client is not None and save_memory:
+        history_text = "\n".join(
+            [f"Q: {t.get('question','')}\nA: {t.get('answer','')}" for t in transcript]
+        )
+        prompt = (
+            "Summarize this coaching session in 2–4 sentences (under 80 words). "
+            "Cover: what topic was practiced, key names or companies mentioned, "
+            "what was decided or coached, and how the conversation went. "
+            "Be specific and concrete.\n\n" + history_text
+        )
+        try:
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=120,
+            )
+            summary = completion.choices[0].message.content.strip().rstrip(".")
+        except Exception as e:
+            logger.error(f"end-session summary error: {e}")
+        full_transcript_json = json.dumps(transcript)
+        # Deduct 2 credits for memory save
+        try:
+            credits_uid = _get_credits_user_id(user_id, account_id)
+            _deduct_credits(credits_uid, 2, feature="memory_save")
+        except Exception as e:
+            logger.warning(f"end-session memory_save credit deduct failed: {e}")
+    elif client is not None and can_summarize:
         history_text = "\n".join(
             [f"Q: {t.get('question','')}\nA: {t.get('answer','')}" for t in transcript[-10:]]
         )
@@ -1993,11 +2024,12 @@ async def end_session(request: Request, data: dict):
             with engine.connect() as conn:
                 conn.execute(text("""
                     INSERT INTO session_history
-                        (session_id, user_id, account_id, role, persona, style, summary, timestamp, duration_seconds)
-                    VALUES (:sid, :uid, :aid, :role, :mode, :style, :summary, :ts, :dur)
+                        (session_id, user_id, account_id, role, persona, style, summary, timestamp, duration_seconds, full_transcript)
+                    VALUES (:sid, :uid, :aid, :role, :mode, :style, :summary, :ts, :dur, :ft)
                     ON CONFLICT (session_id) DO UPDATE SET
-                        summary    = EXCLUDED.summary,
-                        account_id = COALESCE(session_history.account_id, EXCLUDED.account_id)
+                        summary         = EXCLUDED.summary,
+                        full_transcript = COALESCE(EXCLUDED.full_transcript, session_history.full_transcript),
+                        account_id      = COALESCE(session_history.account_id, EXCLUDED.account_id)
                 """), {
                     "sid": session_id,
                     "uid": user_id,
@@ -2008,6 +2040,7 @@ async def end_session(request: Request, data: dict):
                     "summary": summary,
                     "ts": datetime.utcnow().isoformat(),
                     "dur": duration_seconds,
+                    "ft": full_transcript_json,
                 })
                 conn.commit()
         except Exception as e:
@@ -2087,14 +2120,14 @@ async def get_session_history(request: Request, deviceId: str, userEmail: str = 
         with engine.connect() as conn:
             if account_id:
                 rows = conn.execute(text("""
-                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds, full_transcript
                     FROM session_history
                     WHERE account_id = :aid OR user_id = :uid
                     ORDER BY timestamp DESC LIMIT 50
                 """), {"aid": account_id, "uid": user_id}).fetchall()
             else:
                 rows = conn.execute(text("""
-                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds, full_transcript
                     FROM session_history WHERE user_id = :uid
                     ORDER BY timestamp DESC LIMIT 50
                 """), {"uid": user_id}).fetchall()
@@ -2107,6 +2140,7 @@ async def get_session_history(request: Request, deviceId: str, userEmail: str = 
                 "summary": r[4],
                 "timestamp": r[5],
                 "duration_seconds": r[6],
+                "full_transcript": json.loads(r[7]) if r[7] else None,
             }
             for r in rows
         ]
