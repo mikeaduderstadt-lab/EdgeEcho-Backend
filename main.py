@@ -211,9 +211,9 @@ STYLE_COSTS = {
 
 
 def _get_credit_balance(user_id: str) -> dict:
-    """Get or create credits record; returns {balance, plan_type, total_used}."""
+    """Get or create credits record; returns {balance, plan_type, total_used, payg_enabled}."""
     if engine is None:
-        return {"balance": 9999, "plan_type": "free", "total_used": 0}
+        return {"balance": 9999, "plan_type": "free", "total_used": 0, "payg_enabled": False}
     try:
         with engine.connect() as conn:
             conn.execute(text("""
@@ -223,15 +223,15 @@ def _get_credit_balance(user_id: str) -> dict:
             """), {"uid": user_id})
             conn.commit()
             row = conn.execute(
-                text("SELECT balance, plan_type, total_used FROM credits WHERE user_id=:uid"),
+                text("SELECT balance, plan_type, total_used, payg_enabled FROM credits WHERE user_id=:uid"),
                 {"uid": user_id}
             ).fetchone()
         if row:
-            return {"balance": row[0], "plan_type": row[1], "total_used": row[2]}
+            return {"balance": row[0], "plan_type": row[1], "total_used": row[2], "payg_enabled": bool(row[3])}
     except Exception as e:
         logger.error(f"_get_credit_balance error: {e}")
         sentry_sdk.capture_exception(e)
-    return {"balance": 9999, "plan_type": "free", "total_used": 0}
+    return {"balance": 9999, "plan_type": "free", "total_used": 0, "payg_enabled": False}
 
 
 def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_key: str = None) -> int:
@@ -247,7 +247,7 @@ def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_ke
 
         # Lock the row — no other request can touch this user's balance until we commit
         result = conn.execute(text("""
-            SELECT balance FROM credits
+            SELECT balance, payg_enabled FROM credits
             WHERE user_id = :uid
             FOR UPDATE
         """), {"uid": user_id}).fetchone()
@@ -256,7 +256,19 @@ def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_ke
             return 0
 
         current_balance = result[0]
-        new_balance = max(0, current_balance - cost)
+        payg_enabled = bool(result[1])
+
+        if cost > 0 and current_balance < cost:
+            if not payg_enabled:
+                return -1
+            # PAYG: allow negative balance at 1.5x cost (30x markup vs 20x)
+            actual_cost = round(cost * 1.5)
+            new_balance = current_balance - actual_cost
+            op_type = "payg_usage"
+        else:
+            actual_cost = cost
+            new_balance = max(0, current_balance - cost)
+            op_type = "usage"
 
         # Update the balance
         conn.execute(text("""
@@ -264,17 +276,18 @@ def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_ke
             SET balance = :new_balance,
                 total_used = total_used + :cost
             WHERE user_id = :uid
-        """), {"new_balance": new_balance, "cost": cost, "uid": user_id})
+        """), {"new_balance": new_balance, "cost": actual_cost, "uid": user_id})
 
         # Write immutable ledger entry
         conn.execute(text("""
             INSERT INTO credit_ledger
             (user_id, amount, balance_after, operation_type, feature, idempotency_key)
-            VALUES (:uid, :amount, :balance_after, 'usage', :feature, :key)
+            VALUES (:uid, :amount, :balance_after, :op_type, :feature, :key)
         """), {
             "uid": user_id,
-            "amount": -cost,
+            "amount": -actual_cost,
             "balance_after": new_balance,
+            "op_type": op_type,
             "feature": feature,
             "key": idempotency_key
         })
@@ -946,6 +959,7 @@ def init_db():
         # ── Solo plan audio hard-cap tracking ─────────────────────────────────
         "ALTER TABLE credits ADD COLUMN IF NOT EXISTS audio_seconds_used INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE credits ADD COLUMN IF NOT EXISTS audio_seconds_reset_date DATE",
+        "ALTER TABLE credits ADD COLUMN IF NOT EXISTS payg_enabled BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     try:
         with engine.connect() as conn:
@@ -1226,7 +1240,7 @@ async def coach(
         style = "Standard"
         cost = STYLE_COSTS["Standard"]
 
-    if credits["balance"] < cost:
+    if credits["balance"] < cost and not credits.get("payg_enabled", False):
         raise HTTPException(status_code=402, detail={
             "code": "INSUFFICIENT_CREDITS",
             "message": "Insufficient credits. Upgrade your plan or purchase an overage pack.",
@@ -2164,6 +2178,48 @@ async def get_credits(request: Request, deviceId: str, userEmail: str = "anonymo
         "is_founding_member": is_founding,
         "estimated_cost_this_month": round(cost_this_month, 6),
     }
+
+
+@app.post("/enable-payg")
+@limiter.limit(RATE_READS)
+async def enable_payg(request: Request, deviceId: str = Form(...), userEmail: str = Form("anonymous")):
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    raw_user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+    user_key = _get_credits_user_id(raw_user_id, account_id)
+    if not user_key:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE credits SET payg_enabled = TRUE WHERE user_id = :uid
+            """), {"uid": user_key})
+    except Exception as e:
+        logger.error(f"enable-payg error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+    logger.info(f"✅ PAYG enabled for {user_key[:12]}…")
+    return {"payg_enabled": True, "message": "Pay-as-you-go enabled. Overages will be tracked at 1.5x credit cost."}
+
+
+@app.post("/disable-payg")
+@limiter.limit(RATE_READS)
+async def disable_payg(request: Request, deviceId: str = Form(...), userEmail: str = Form("anonymous")):
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    raw_user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+    user_key = _get_credits_user_id(raw_user_id, account_id)
+    if not user_key:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE credits SET payg_enabled = FALSE WHERE user_id = :uid
+            """), {"uid": user_key})
+    except Exception as e:
+        logger.error(f"disable-payg error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+    logger.info(f"🔴 PAYG disabled for {user_key[:12]}…")
+    return {"payg_enabled": False, "message": "Pay-as-you-go disabled. Service will stop when credits reach zero."}
 
 
 def _payment_method_label(pm) -> str | None:
