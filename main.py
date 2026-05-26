@@ -1724,9 +1724,9 @@ async def upload_context(
 # ========================
 
 BRIEFING_TIER_CREDITS = {
-    "quick_read": 2,
-    "deep_brief": 8,
-    "war_room":   20,
+    "quick_read": 5,
+    "deep_brief": 6,
+    "war_room":   7,
 }
 
 
