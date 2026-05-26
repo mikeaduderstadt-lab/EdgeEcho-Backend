@@ -3262,7 +3262,8 @@ def _create_account_or_get(email: str) -> str:
 
 
 def _ensure_free_credits(account_id: str) -> None:
-    """Provision 30 free-tier credits for a newly verified account if none exist.
+    """Provision 60 free-tier credits for a newly verified account if none exist,
+    and set a monthly reset_date so the cron refills them every 30 days.
 
     Idempotent — safe to call on every sign-in; only acts when the account has
     no credits row at all (brand-new registrations with no prior anonymous usage).
@@ -3279,11 +3280,12 @@ def _ensure_free_credits(account_id: str) -> None:
                 return
             # Stable synthetic user_id keyed to the account (never collides with device keys)
             uid = f"account_{account_id}"
+            reset_date = (datetime.utcnow() + timedelta(days=30)).isoformat()
             conn.execute(text("""
-                INSERT INTO credits (user_id, account_id, balance, plan_type, total_used)
-                VALUES (:uid, :aid, 30, 'free', 0)
+                INSERT INTO credits (user_id, account_id, balance, plan_type, total_used, reset_date)
+                VALUES (:uid, :aid, 60, 'free', 0, :reset)
                 ON CONFLICT (user_id) DO NOTHING
-            """), {"uid": uid, "aid": account_id})
+            """), {"uid": uid, "aid": account_id, "reset": reset_date})
             conn.commit()
         logger.info(f"🎁 Free credits provisioned for new account {account_id[:8]}…")
     except Exception as e:
