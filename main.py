@@ -1502,7 +1502,7 @@ async def text_to_speech(request: Request, data: dict):
                 return  # exhaust generator cleanly; client gets a partial/empty response
 
         _track_usage(_tts_user_key, data.get("userEmail", ""), "cartesia_tts",
-                     len(text), len(text) * 0.000015)
+                     len(text), len(text) * 0.0000001)
         return StreamingResponse(cartesia_stream(), media_type="audio/mpeg")
 
     # Cartesia unavailable — return text-only; client handles graceful degradation
