@@ -875,6 +875,11 @@ def init_db():
         "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS full_transcript TEXT",
         "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS session_title TEXT",
+        "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS session_name TEXT",
+        "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS prep_goal TEXT",
+        "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS prep_notes TEXT",
+        "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS briefing_result JSONB",
+        "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'",
         "ALTER TABLE preferences      ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE stripe_customers ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE founding_members ADD COLUMN IF NOT EXISTS account_id TEXT",
@@ -1768,12 +1773,14 @@ BRIEFING_TIER_CREDITS = {
 @app.post("/brief")
 @limiter.limit(RATE_BRIEF)
 async def brief_url(request: Request, data: dict):
-    url        = data.get("url", "").strip()
-    device_id  = data.get("deviceId", "")
-    user_email = data.get("userEmail", "anonymous")
-    role       = (data.get("role", "")   or "General").strip()
-    mode       = (data.get("mode", "")   or "Analyst").strip()
-    tier       = (data.get("tier", "deep_brief") or "deep_brief").strip()
+    url          = data.get("url", "").strip()
+    device_id    = data.get("deviceId", "")
+    user_email   = data.get("userEmail", "anonymous")
+    role         = (data.get("role", "")   or "General").strip()
+    mode         = (data.get("mode", "")   or "Analyst").strip()
+    tier         = (data.get("tier", "deep_brief") or "deep_brief").strip()
+    goal         = data.get("goal", "").strip()
+    context_text = data.get("context_text", "").strip()
 
     if tier not in BRIEFING_TIER_CREDITS:
         tier = "deep_brief"
@@ -1865,12 +1872,21 @@ async def brief_url(request: Request, data: dict):
         )
         max_tokens = 900
 
+    goal_prefix = (
+        f"The user's goal for this session: {goal}\n\n"
+        f"Using the above goal and the following material, "
+    ) if goal else ""
+
+    extra_context = (
+        f"\n\nAdditional context from uploaded file:\n{context_text[:8000]}"
+    ) if context_text else ""
+
     system_content = (
         f"You are a pre-call intelligence analyst.\n"
         f"A user is about to enter a {role} conversation using the {mode} mode.\n"
         f"They have provided this background material:\n\n"
-        f"{jina_content}\n\n"
-        f"{sections_instruction}"
+        f"{jina_content}{extra_context}\n\n"
+        f"{goal_prefix}{sections_instruction}"
     )
 
     try:
@@ -4200,6 +4216,211 @@ async def debug_prompts(request: Request):
                 })
 
     return {"count": len(results), "prompts": results}
+
+
+# ========================
+# PRE-CALL SETUP
+# ========================
+
+PREP_SESSION_ALLOWED_PLANS = {"pro", "command", "operator", "founding_50"}
+
+@app.post("/prep-session")
+@limiter.limit(RATE_BRIEF)
+async def prep_session(request: Request, data: dict):
+    session_name  = (data.get("session_name", "") or "").strip()
+    goal          = (data.get("goal", "") or "").strip()
+    url           = (data.get("url", "") or "").strip()
+    file_content  = (data.get("file_content", "") or "").strip()
+    device_id     = data.get("deviceId", "")
+    user_email    = data.get("userEmail", "anonymous")
+    role          = (data.get("role", "") or "General").strip()
+    mode          = (data.get("mode", "") or "Analyst").strip()
+    tier          = (data.get("tier", "deep_brief") or "deep_brief").strip()
+
+    if tier not in BRIEFING_TIER_CREDITS:
+        tier = "deep_brief"
+
+    user_id, account_id, _ = _resolve_user(request, device_id, user_email)
+    user_id = _get_credits_user_id(user_id, account_id)
+    plan_info = _get_credit_balance(user_id)
+
+    if plan_info["plan_type"] not in PREP_SESSION_ALLOWED_PLANS:
+        raise HTTPException(status_code=403, detail={
+            "code": "PLAN_REQUIRED",
+            "message": "Pre-Call Setup requires Pro plan or above.",
+            "required_plan": "pro",
+        })
+
+    if url and plan_info["plan_type"] not in BRIEFING_ALLOWED_PLANS:
+        url = ""  # silently drop URL for plans below command
+
+    # Fetch URL content if provided
+    jina_content = ""
+    fallback_used = False
+    if url:
+        if not (url.startswith("http://") or url.startswith("https://")):
+            url = ""
+        elif any(b in url.lower() for b in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.", "10.", "192.168.", "172.16.")):
+            url = ""
+        else:
+            try:
+                import httpx as _httpx
+                async with _httpx.AsyncClient() as _jina_http:
+                    jina_resp = await _jina_http.get(
+                        f"https://r.jina.ai/{url}",
+                        headers={"Accept": "text/plain"},
+                        follow_redirects=True,
+                        timeout=20.0,
+                    )
+                if jina_resp.status_code == 200 and jina_resp.text.strip():
+                    jina_content = jina_resp.text[:12000]
+            except Exception as e:
+                logger.warning(f"Jina fetch failed for {url}: {e}")
+                fallback_used = True
+
+    # Build material from all sources
+    material_parts = []
+    if jina_content:
+        material_parts.append(f"URL Content ({url}):\n{jina_content}")
+    elif url and fallback_used:
+        material_parts.append(f"URL: {url}\n(Direct page content unavailable — brief based on domain context only.)")
+    if file_content:
+        material_parts.append(f"Uploaded document:\n{file_content[:8000]}")
+    material = "\n\n".join(material_parts) if material_parts else "(No URL or file provided)"
+
+    goal_prefix = f"The user's goal for this session: {goal}\n\n" if goal else ""
+
+    system_content = (
+        f"You are a pre-call intelligence analyst helping someone prepare for a {role} conversation.\n"
+        f"{goal_prefix}"
+        f"Background material:\n{material}\n\n"
+        f"Build a structured preparation dossier as valid JSON with exactly these keys:\n"
+        f"- summary: 2-3 sentence overview of the situation\n"
+        f"- key_findings: array of 4-6 specific bullet points\n"
+        f"- goals_and_angles: array of 3-5 tactical approaches tailored to the goal\n"
+        f"- plan: paragraph or numbered steps for how to approach this session\n\n"
+        f"Return ONLY valid JSON. No markdown code blocks. No extra text. Be specific not generic."
+    )
+
+    credits_cost = BRIEFING_TIER_CREDITS.get(tier, 6)
+    if plan_info["balance"] < credits_cost and not plan_info.get("payg_enabled", False):
+        raise HTTPException(status_code=402, detail={
+            "code": "INSUFFICIENT_CREDITS",
+            "message": "Insufficient credits for Pre-Call Setup.",
+            "balance": plan_info["balance"],
+            "cost": credits_cost,
+        })
+
+    try:
+        groq_response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": system_content}],
+            max_tokens=1200,
+            temperature=0.4,
+        )
+        raw = groq_response.choices[0].message.content.strip()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"prep-session Groq error: {e}")
+        raise HTTPException(status_code=500, detail=f"Brief generation failed: {str(e)}")
+
+    # Parse JSON; fall back to raw text in all fields if parse fails
+    try:
+        dossier = json.loads(raw)
+        if not isinstance(dossier.get("key_findings"), list):
+            dossier["key_findings"] = [dossier.get("key_findings", "")]
+        if not isinstance(dossier.get("goals_and_angles"), list):
+            dossier["goals_and_angles"] = [dossier.get("goals_and_angles", "")]
+    except Exception:
+        dossier = {
+            "summary": raw[:500],
+            "key_findings": [],
+            "goals_and_angles": [],
+            "plan": raw,
+        }
+
+    # Deduct credits
+    idem_key = hashlib.sha256(
+        f"{user_id}:prep:{int(time.time() // 10)}".encode()
+    ).hexdigest()
+    _deduct_credits(user_id, credits_cost, feature="prep_session", idempotency_key=idem_key)
+
+    # Save to session_history with status='prepped'
+    new_session_id = str(uuid.uuid4()) if 'uuid' in dir() else __import__('uuid').uuid4().__str__()
+    try:
+        import uuid as _uuid
+        new_session_id = str(_uuid.uuid4())
+    except Exception:
+        pass
+
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    INSERT INTO session_history
+                        (session_id, user_id, account_id, role, persona, style,
+                         summary, session_title, session_name, prep_goal, briefing_result,
+                         timestamp, duration_seconds, status)
+                    VALUES
+                        (:sid, :uid, :aid, :role, :mode, 'Standard',
+                         :summary, :title, :sname, :goal, :briefing,
+                         :ts, 0, 'prepped')
+                    ON CONFLICT (session_id) DO NOTHING
+                """), {
+                    "sid":      new_session_id,
+                    "uid":      user_id,
+                    "aid":      account_id,
+                    "role":     role,
+                    "mode":     mode,
+                    "summary":  dossier.get("summary", "")[:500],
+                    "title":    session_name or "Untitled Session",
+                    "sname":    session_name or None,
+                    "goal":     goal or None,
+                    "briefing": json.dumps(dossier),
+                    "ts":       datetime.utcnow().isoformat(),
+                })
+                conn.commit()
+        except Exception as e:
+            logger.error(f"prep-session DB error: {e}")
+
+    # Cache brief so /coach picks it up
+    brief_text_for_cache = f"Pre-call preparation:\nGoal: {goal}\n\nSummary: {dossier.get('summary','')}\n\nKey findings:\n" + "\n".join(f"- {f}" for f in dossier.get("key_findings", [])) + "\n\nPlan: " + dossier.get("plan", "")
+    _save_ctx_cache(user_id, brief_text_for_cache)
+
+    logger.info(f"⚡ prep-session {new_session_id[:8]}… | {role}/{mode} | {credits_cost} credits")
+    return {
+        "session_id":   new_session_id,
+        "session_name": session_name or "Untitled Session",
+        "briefing":     dossier,
+        "credits_used": credits_cost,
+    }
+
+
+@app.patch("/prep-session/{session_id}/notes")
+@limiter.limit(RATE_READS)
+async def update_prep_notes(session_id: str, request: Request):
+    data       = await request.json()
+    notes      = (data.get("notes", "") or "").strip()
+    device_id  = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+
+    user_id, account_id, _ = _resolve_user(request, device_id, user_email)
+    user_id = _get_credits_user_id(user_id, account_id)
+
+    if engine is None:
+        return {"status": "skipped"}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE session_history SET prep_notes = :notes
+                WHERE session_id = :sid
+                AND (user_id = :uid OR account_id = :aid)
+            """), {"notes": notes, "sid": session_id, "uid": user_id, "aid": account_id})
+            conn.commit()
+    except Exception as e:
+        logger.error(f"update_prep_notes error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save notes")
+    return {"status": "saved"}
 
 
 @app.on_event("startup")
