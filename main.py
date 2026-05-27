@@ -874,6 +874,7 @@ def init_db():
         "ALTER TABLE credits          ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS full_transcript TEXT",
+        "ALTER TABLE session_history  ADD COLUMN IF NOT EXISTS session_title TEXT",
         "ALTER TABLE preferences      ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE stripe_customers ADD COLUMN IF NOT EXISTS account_id TEXT",
         "ALTER TABLE founding_members ADD COLUMN IF NOT EXISTS account_id TEXT",
@@ -2055,16 +2056,31 @@ async def end_session(request: Request, data: dict):
         except Exception as e:
             logger.error(f"end-session summary error: {e}")
 
+    # Generate a short 3-5 word title from the summary
+    session_title = None
+    if client is not None and not summary.startswith("Session with "):
+        try:
+            title_completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": f"Generate a 3-5 word title for this conversation. Return only the title, nothing else. No quotes, no punctuation at the end.\n\n{summary}"}],
+                temperature=0.3,
+                max_tokens=20,
+            )
+            session_title = title_completion.choices[0].message.content.strip().strip('"').strip("'").rstrip(".")
+        except Exception as e:
+            logger.error(f"end-session title error: {e}")
+
     # Persist to session_history with account_id for cross-device memory
     if engine is not None and session_id:
         try:
             with engine.connect() as conn:
                 conn.execute(text("""
                     INSERT INTO session_history
-                        (session_id, user_id, account_id, role, persona, style, summary, timestamp, duration_seconds, full_transcript)
-                    VALUES (:sid, :uid, :aid, :role, :mode, :style, :summary, :ts, :dur, :ft)
+                        (session_id, user_id, account_id, role, persona, style, summary, session_title, timestamp, duration_seconds, full_transcript)
+                    VALUES (:sid, :uid, :aid, :role, :mode, :style, :summary, :session_title, :ts, :dur, :ft)
                     ON CONFLICT (session_id) DO UPDATE SET
                         summary         = EXCLUDED.summary,
+                        session_title   = COALESCE(EXCLUDED.session_title, session_history.session_title),
                         full_transcript = COALESCE(EXCLUDED.full_transcript, session_history.full_transcript),
                         account_id      = COALESCE(session_history.account_id, EXCLUDED.account_id)
                 """), {
@@ -2075,6 +2091,7 @@ async def end_session(request: Request, data: dict):
                     "mode": mode,
                     "style": style,
                     "summary": summary,
+                    "session_title": session_title,
                     "ts": datetime.utcnow().isoformat(),
                     "dur": duration_seconds,
                     "ft": full_transcript_json,
@@ -2157,14 +2174,14 @@ async def get_session_history(request: Request, deviceId: str, userEmail: str = 
         with engine.connect() as conn:
             if account_id:
                 rows = conn.execute(text("""
-                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds, full_transcript
+                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds, full_transcript, session_title
                     FROM session_history
                     WHERE account_id = :aid OR user_id = :uid
                     ORDER BY timestamp DESC LIMIT 50
                 """), {"aid": account_id, "uid": user_id}).fetchall()
             else:
                 rows = conn.execute(text("""
-                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds, full_transcript
+                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds, full_transcript, session_title
                     FROM session_history WHERE user_id = :uid
                     ORDER BY timestamp DESC LIMIT 50
                 """), {"uid": user_id}).fetchall()
@@ -2178,6 +2195,7 @@ async def get_session_history(request: Request, deviceId: str, userEmail: str = 
                 "timestamp": r[5],
                 "duration_seconds": r[6],
                 "full_transcript": json.loads(r[7]) if r[7] else None,
+                "session_title": r[8],
             }
             for r in rows
         ]
@@ -2185,6 +2203,49 @@ async def get_session_history(request: Request, deviceId: str, userEmail: str = 
     except Exception as e:
         logger.error(f"get_session_history error: {e}")
         return {"sessions": []}
+
+
+@app.patch("/session/{session_id}/rename")
+@limiter.limit(RATE_READS)
+async def rename_session(session_id: str, request: Request, data: dict):
+    title = (data.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title required")
+    device_id  = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+    user_id, account_id, _ = _resolve_user(request, device_id, user_email)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE session_history SET session_title = :title
+                WHERE session_id = :sid AND (user_id = :uid OR account_id = :aid)
+            """), {"title": title, "sid": session_id, "uid": user_id, "aid": account_id or ""})
+            conn.commit()
+    except Exception as e:
+        logger.error(f"rename_session error: {e}")
+        raise HTTPException(status_code=500, detail="Rename failed")
+    return {"status": "ok"}
+
+
+@app.delete("/session/{session_id}")
+@limiter.limit(RATE_READS)
+async def delete_session(session_id: str, request: Request, deviceId: str = "", userEmail: str = "anonymous"):
+    user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                DELETE FROM session_history
+                WHERE session_id = :sid AND (user_id = :uid OR account_id = :aid)
+            """), {"sid": session_id, "uid": user_id, "aid": account_id or ""})
+            conn.commit()
+    except Exception as e:
+        logger.error(f"delete_session error: {e}")
+        raise HTTPException(status_code=500, detail="Delete failed")
+    return {"status": "deleted"}
 
 
 @app.get("/credits")
