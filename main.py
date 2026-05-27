@@ -1,4 +1,5 @@
 import io
+import csv
 import os
 import json
 import tempfile
@@ -2583,25 +2584,26 @@ async def export_data(request: Request, deviceId: str, userEmail: str = "anonymo
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     export_email = resolved_email if account_id else userEmail
-    payload: dict = {
-        "export_metadata": {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "app": "CerebroEcho",
-            "schema_version": "2",
-        },
-        "identity": {
-            "email": export_email,
-            "device_id": deviceId,
-            "authenticated": account_id is not None,
-        },
-        "account": None,
-        "preferences": None,
-        "sessions": [],
-        "founding_member": None,
+    account_info: dict = {
+        "email": export_email,
+        "device_id": deviceId,
+        "authenticated": str(account_id is not None),
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "plan": "",
+        "credits_remaining": "",
+        "credits_used_total": "",
+        "credits_reset_date": "",
+        "subscription_status": "",
+        "founding_member_since": "",
+        "preferences": "",
     }
+    sessions_rows: list = []
+    credit_ledger_rows: list = []
+    usage_events_rows: list = []
 
     try:
         with engine.connect() as conn:
+            # Account / credits
             if account_id:
                 row = conn.execute(text("""
                     SELECT balance, plan_type, total_used, reset_date, subscription_status
@@ -2613,29 +2615,26 @@ async def export_data(request: Request, deviceId: str, userEmail: str = "anonymo
                     FROM credits WHERE user_id = :uid
                 """), {"uid": user_id}).fetchone()
             if row:
-                payload["account"] = {
-                    "plan": row[1],
-                    "credits_remaining": row[0],
-                    "credits_used_total": row[2],
-                    "credits_reset_date": row[3],
-                    "subscription_status": row[4],
-                }
+                account_info["plan"] = row[1]
+                account_info["credits_remaining"] = row[0]
+                account_info["credits_used_total"] = row[2]
+                account_info["credits_reset_date"] = row[3]
+                account_info["subscription_status"] = row[4]
 
+            # Preferences
             if account_id:
                 row = conn.execute(text("""
-                    SELECT preference_text, updated_at FROM preferences
+                    SELECT preference_text FROM preferences
                     WHERE account_id = :aid OR user_id = :uid LIMIT 1
                 """), {"aid": account_id, "uid": user_id}).fetchone()
             else:
                 row = conn.execute(text("""
-                    SELECT preference_text, updated_at FROM preferences WHERE user_id = :uid
+                    SELECT preference_text FROM preferences WHERE user_id = :uid
                 """), {"uid": user_id}).fetchone()
             if row:
-                payload["preferences"] = {
-                    "text": row[0],
-                    "last_updated": row[1],
-                }
+                account_info["preferences"] = row[0]
 
+            # Session history
             if account_id:
                 rows = conn.execute(text("""
                     SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
@@ -2648,19 +2647,48 @@ async def export_data(request: Request, deviceId: str, userEmail: str = "anonymo
                     FROM session_history WHERE user_id = :uid
                     ORDER BY timestamp DESC
                 """), {"uid": user_id}).fetchall()
-            payload["sessions"] = [
-                {
-                    "session_id": r[0],
-                    "role": r[1],
-                    "mode": r[2],
-                    "style": r[3],
-                    "summary": r[4],
-                    "timestamp": r[5],
-                    "duration_seconds": r[6],
-                }
+            sessions_rows = [
+                [r[0], r[1], r[2], r[3], r[4], r[5], r[6]]
                 for r in rows
             ]
 
+            # Credit ledger
+            if account_id:
+                rows = conn.execute(text("""
+                    SELECT id, amount, balance_after, operation_type, feature, created_at
+                    FROM credit_ledger WHERE user_id = :uid
+                    ORDER BY created_at DESC
+                """), {"uid": user_id}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT id, amount, balance_after, operation_type, feature, created_at
+                    FROM credit_ledger WHERE user_id = :uid
+                    ORDER BY created_at DESC
+                """), {"uid": user_id}).fetchall()
+            credit_ledger_rows = [
+                [r[0], r[1], r[2], r[3], r[4], r[5]]
+                for r in rows
+            ]
+
+            # Usage events
+            if account_id:
+                rows = conn.execute(text("""
+                    SELECT id, feature, provider, credits_charged, raw_cost_usd, status, created_at
+                    FROM usage_events WHERE user_id = :uid
+                    ORDER BY created_at DESC
+                """), {"uid": user_id}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT id, feature, provider, credits_charged, raw_cost_usd, status, created_at
+                    FROM usage_events WHERE user_id = :uid
+                    ORDER BY created_at DESC
+                """), {"uid": user_id}).fetchall()
+            usage_events_rows = [
+                [r[0], r[1], r[2], r[3], r[4], r[5], r[6]]
+                for r in rows
+            ]
+
+            # Founding member
             if account_id:
                 row = conn.execute(text("""
                     SELECT purchase_date FROM founding_members WHERE account_id = :aid OR user_id = :uid LIMIT 1
@@ -2670,17 +2698,50 @@ async def export_data(request: Request, deviceId: str, userEmail: str = "anonymo
                     SELECT purchase_date FROM founding_members WHERE user_id = :uid
                 """), {"uid": user_id}).fetchone()
             if row:
-                payload["founding_member"] = {"purchase_date": row[0]}
+                account_info["founding_member_since"] = row[0]
 
     except Exception as e:
         logger.error(f"export-data error for {user_id[:24]}…: {e}")
         raise HTTPException(status_code=500, detail="Export failed. Please try again.")
 
-    logger.info(f"📦 Data export for {user_id[:24]}… ({len(payload['sessions'])} sessions)")
-    filename = f"cerebroecho-export-{datetime.utcnow().strftime('%Y%m%d')}.json"
+    # Build multi-section CSV
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    # Section 1: Account Info
+    writer.writerow(["# ACCOUNT INFO"])
+    writer.writerow(["field", "value"])
+    for field, value in account_info.items():
+        writer.writerow([field, value])
+    writer.writerow([])
+
+    # Section 2: Sessions
+    writer.writerow(["# SESSIONS"])
+    writer.writerow(["session_id", "role", "mode", "style", "summary", "timestamp", "duration_seconds"])
+    for r in sessions_rows:
+        writer.writerow(r)
+    writer.writerow([])
+
+    # Section 3: Credit Ledger
+    writer.writerow(["# CREDIT LEDGER"])
+    writer.writerow(["id", "amount", "balance_after", "operation_type", "feature", "created_at"])
+    for r in credit_ledger_rows:
+        writer.writerow(r)
+    writer.writerow([])
+
+    # Section 4: Usage Events
+    writer.writerow(["# USAGE EVENTS"])
+    writer.writerow(["id", "feature", "provider", "credits_charged", "raw_cost_usd", "status", "created_at"])
+    for r in usage_events_rows:
+        writer.writerow(r)
+
+    csv_content = buf.getvalue()
+
+    logger.info(f"📦 Data export for {user_id[:24]}… ({len(sessions_rows)} sessions, {len(credit_ledger_rows)} ledger, {len(usage_events_rows)} events)")
+    filename = f"cerebroecho-data-export-{datetime.utcnow().strftime('%Y%m%d')}.csv"
     return Response(
-        content=json.dumps(payload, indent=2),
-        media_type="application/json",
+        content=csv_content,
+        media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
