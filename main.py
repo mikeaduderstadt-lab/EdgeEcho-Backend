@@ -2612,6 +2612,18 @@ async def billing_portal(request: Request, data: dict):
                     text("SELECT customer_id FROM stripe_customers WHERE account_id = :aid OR user_id = :uid LIMIT 1"),
                     {"aid": account_id, "uid": user_id}
                 ).fetchone()
+                # Fallback: pre-migration rows have NULL account_id; join via credits for cross-device match
+                if not row:
+                    row = conn.execute(
+                        text("""
+                            SELECT sc.customer_id
+                            FROM stripe_customers sc
+                            JOIN credits c ON c.user_id = sc.user_id
+                            WHERE c.account_id = :aid
+                            LIMIT 1
+                        """),
+                        {"aid": account_id}
+                    ).fetchone()
             else:
                 row = conn.execute(
                     text("SELECT customer_id FROM stripe_customers WHERE user_id=:uid"),
