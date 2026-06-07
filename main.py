@@ -204,13 +204,16 @@ except Exception as e:
 # CREDIT SYSTEM
 # ========================
 PLAN_CREDITS = {
-    "free":        60,      # one-time, never resets
-    "echo":        600,     # Solo $9.99/mo  ← STRIPE_PRICE_ECHO
-    "pro":         7000,    # Pro $19.99/mo  ← STRIPE_PRICE_PRO
-    "command":     14000,   # Power $39.99/mo ← STRIPE_PRICE_COMMAND
-    "operator":    14000,   # Operator tier  ← STRIPE_PRICE_OPERATOR
-    "founding_50": 14000,   # LTD $299       ← STRIPE_PRICE_FOUNDING50
+    "free":        60,       # one-time, never resets (text-only)
+    "echo":        4000,     # Solo $9.99/mo   ← STRIPE_PRICE_ECHO   (now incl. ~1 hr audio)
+    "pro":         75000,    # Pro $29.99/mo   ← STRIPE_PRICE_PRO    (~20 hrs audio)
+    "command":     150000,   # Power $59.99/mo ← STRIPE_PRICE_COMMAND (~40 hrs audio)
+    "operator":    150000,   # Operator (hidden, parity w/ Power) ← STRIPE_PRICE_OPERATOR
+    "founding_50": 14000,    # LTD $299 — existing members honored ← STRIPE_PRICE_FOUNDING50
 }
+# NOTE (Jun 7 2026): values resized for FULL usage-based metering (TTS now charged).
+# ~3,600 credits ≈ 1 hr of live audio. Stripe Dashboard prices for pro/command MUST be
+# updated to $29.99/$59.99 separately — changing these numbers does NOT change what Stripe bills.
 
 STYLE_COSTS = {
     "Quick":     1,
@@ -222,6 +225,33 @@ STYLE_COSTS = {
     "bullet":    2,
     "script":    2,
 }
+
+# ── METERED BILLING ───────────────────────────────────────────────────────
+# True usage-based billing: measure each action's raw API cost in USD, convert
+# to credits at a fixed cost-basis, charge that. STYLE_COSTS above is retained
+# ONLY for mapping Quick/Standard/Full → max_tokens, never as the charge.
+import math
+CREDIT_COST_BASIS_USD = float(os.environ.get("CREDIT_COST_BASIS_USD", "0.000143"))
+# Provider unit costs in USD. Env-overridable. VERIFY against live provider pricing.
+PROVIDER_RATES = {
+    "llama-3.1-8b-instant":     {"in": 0.05e-6, "out": 0.08e-6},   # $/token
+    "llama-3.3-70b-versatile":  {"in": 0.59e-6, "out": 0.79e-6},   # $/token
+    "whisper":                  {"sec": 0.04/3600},                # $/audio-second ($0.04/hr, whisper-large-v3-turbo — verified Jun 7 2026)
+    "cartesia_tts":             {"char": 0.000035},                # $/char (~$35/1M chars, Cartesia Sonic 3 — verified Jun 7 2026)
+    "openai_tts":               {"char": 15e-6},                   # $/char (tts-1)
+    "jina_fetch":               {"req": 0.0008},                   # $/request ← VERIFY
+}
+
+
+def _llm_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    r = PROVIDER_RATES.get(model, {"in": 0.59e-6, "out": 0.79e-6})
+    return (prompt_tokens or 0) * r["in"] + (completion_tokens or 0) * r["out"]
+
+
+def _cost_to_credits(raw_cost_usd: float) -> int:
+    if raw_cost_usd <= 0:
+        return 1
+    return max(1, math.ceil(raw_cost_usd / CREDIT_COST_BASIS_USD))
 
 
 def _get_credit_balance(user_id: str) -> dict:
@@ -248,9 +278,12 @@ def _get_credit_balance(user_id: str) -> dict:
     return {"balance": 9999, "plan_type": "free", "total_used": 0, "payg_enabled": False}
 
 
-def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_key: str = None) -> int:
+def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_key: str = None,
+                    provider: str = None, input_units: float = None, output_units: float = None,
+                    raw_cost_usd: float = None, status: str = "charged") -> int:
     with engine.begin() as conn:
-        # Check idempotency — if this key was already processed, return current balance
+        # Check idempotency — if this key was already processed, return current balance.
+        # Short-circuit BEFORE any usage_events write so we never duplicate a metering row.
         if idempotency_key:
             existing = conn.execute(text("""
                 SELECT balance_after FROM credit_ledger
@@ -305,6 +338,32 @@ def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_ke
             "feature": feature,
             "key": idempotency_key
         })
+
+        # Metered usage_events row (same atomic transaction). Only when a provider
+        # is supplied. credits_charged = actual_cost (post-PAYG amount). A failure
+        # here must NOT abort the credit deduction — log and continue.
+        if provider is not None:
+            try:
+                conn.execute(text("""
+                    INSERT INTO usage_events
+                    (user_id, feature, provider, input_units, output_units,
+                     raw_cost_usd, credits_charged, status, idempotency_key)
+                    VALUES
+                    (:uid, :feature, :provider, :in_units, :out_units,
+                     :raw_cost, :credits, :status, :key)
+                """), {
+                    "uid":       user_id,
+                    "feature":   feature,
+                    "provider":  provider,
+                    "in_units":  input_units,
+                    "out_units": output_units,
+                    "raw_cost":  raw_cost_usd,
+                    "credits":   actual_cost,
+                    "status":    status,
+                    "key":       idempotency_key,
+                })
+            except Exception as _ue:
+                logger.error(f"usage_events insert failed (non-fatal): {_ue}")
 
         return new_balance
 
@@ -1249,7 +1308,8 @@ async def coach(
     user_key = _get_credits_user_id(raw_user_id, account_id)
 
     # ── Credit check + plan metadata ──
-    cost = STYLE_COSTS.get(style, 1)
+    # Metered billing: the real charge is computed AFTER the LLM/STT call from
+    # actual token + audio usage. STYLE_COSTS still drives max_tokens via style.
     credits = _get_credit_balance(user_key)
     plan_type = credits["plan_type"]
     tts_allowed = plan_type in TTS_ALLOWED_PLANS
@@ -1260,21 +1320,23 @@ async def coach(
     if mode in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
         mode = "Diplomat"
 
-    # Free plan: Quick + Standard only (no Full — 4-credit responses)
+    # Free plan: Quick + Standard only (no Full — long responses)
     if plan_type == "free" and style == "Full":
         style = "Standard"
-        cost = STYLE_COSTS["Standard"]
 
-    if credits["balance"] < cost and not credits.get("payg_enabled", False):
+    # Conservative up-front gate: require at least 1 credit (or PAYG enabled).
+    # Real metered charge happens post-call so we never block a legitimate request.
+    if credits["balance"] < 1 and not credits.get("payg_enabled", False):
         raise HTTPException(status_code=402, detail={
             "code": "INSUFFICIENT_CREDITS",
             "message": "Insufficient credits. Upgrade your plan or purchase an overage pack.",
             "balance": credits["balance"],
-            "cost": cost,
+            "cost": 1,
         })
 
     start_time = time.time()
     temp_filename = None
+    whisper_seconds = 0.0  # best-effort STT duration for metered billing
 
     try:
         # --- Transcript path: pre-transcribed text provided by frontend (e.g. Deepgram streaming) ---
@@ -1335,6 +1397,8 @@ async def coach(
                 temp_filename = None
 
             transcript = transcription.strip() if transcription else ""
+            # Best-effort audio duration for metered Whisper billing (~32000 bytes/sec).
+            whisper_seconds = len(content) / 32000
             _track_usage(user_key, userEmail, "whisper_transcription",
                          len(content), len(content) / 16000 / 2 * 0.0001)
 
@@ -1451,14 +1515,29 @@ async def coach(
         logger.info(f"✅ Full answer text ({len(answer)} chars): {answer[:100]}...")
         _track_usage(user_key, userEmail, "groq_llm",
                      len(answer), len(answer) / 4 * 0.0000008)
+
+        # ── Metered billing: real LLM token usage + best-effort Whisper seconds ──
+        _usage = getattr(completion, "usage", None)
+        pt = getattr(_usage, "prompt_tokens", None) if _usage else None
+        ct = getattr(_usage, "completion_tokens", None) if _usage else None
+        raw_cost = (
+            _llm_cost_usd("llama-3.1-8b-instant", pt, ct)
+            + whisper_seconds * PROVIDER_RATES["whisper"]["sec"]
+        )
+        metered_credits = _cost_to_credits(raw_cost)
+
         idem_key = hashlib.sha256(
             f"{user_key}:{transcript[:200]}:{int(time.time() // 10)}".encode()
         ).hexdigest()
-        credits_remaining = _deduct_credits(user_key, cost, feature=f"coach:{style}", idempotency_key=idem_key)
+        credits_remaining = _deduct_credits(
+            user_key, metered_credits, feature=f"coach:{style}", idempotency_key=idem_key,
+            provider="groq+whisper", input_units=pt, output_units=ct, raw_cost_usd=raw_cost,
+        )
         if credits_remaining < 0:
-            credits_remaining = max(0, credits["balance"] - cost)
+            credits_remaining = max(0, credits["balance"] - metered_credits)
         processing_time = time.time() - start_time
-        logger.info(f"✅ Answer generated in {processing_time:.2f}s | -{cost} credits → {credits_remaining} remaining")
+        logger.info(f"✅ Answer generated in {processing_time:.2f}s | -{metered_credits} credits "
+                    f"(raw ${raw_cost:.6f}, pt={pt} ct={ct} stt={whisper_seconds:.1f}s) → {credits_remaining} remaining")
 
         # Confidence — computed from existing data, no extra API call
         finish_reason = completion.choices[0].finish_reason
@@ -1519,11 +1598,22 @@ async def text_to_speech(request: Request, data: dict):
             "X-API-Key": cartesia_api_key,
             "Content-Type": "application/json",
         }
-        logger.info(f"🎙️ Cartesia TTS sonic-3/24kHz voice={voice_id[:8]}… len={len(text)}")
+        # ── Metered billing: charge the REAL Cartesia per-character cost ──
+        # TTS is the dominant cost of an audio whisper, so it must be metered like
+        # everything else (decided Jun 7 2026). Cost is known up front from char count.
+        tts_raw_cost = len(text) * PROVIDER_RATES["cartesia_tts"]["char"]
+        tts_credits  = _cost_to_credits(tts_raw_cost)
+        # Idempotency: dedupe accidental double-fires of the SAME text within a 10s
+        # window (client retries, React strict-mode) without blocking a later re-listen.
+        tts_idem = hashlib.sha256(
+            f"{_tts_user_key}:tts:{hashlib.sha256(text.encode()).hexdigest()}:{int(time.time() // 10)}".encode()
+        ).hexdigest()
+        logger.info(f"🎙️ Cartesia TTS sonic-3/24kHz voice={voice_id[:8]}… len={len(text)} → {tts_credits} cr (raw ${tts_raw_cost:.6f})")
 
         # Async generator keeps FastAPI's event loop unblocked during the entire stream.
         # 512-byte chunks deliver the first audio packet to the browser ~2× faster than 1024.
         async def cartesia_stream():
+            streamed_ok = False
             try:
                 async with httpx.AsyncClient(timeout=30.0) as http:
                     async with http.stream(
@@ -1536,13 +1626,22 @@ async def text_to_speech(request: Request, data: dict):
                         logger.info("✅ Cartesia stream open")
                         async for chunk in resp.aiter_bytes(chunk_size=512):
                             yield chunk
+                streamed_ok = True
             except Exception as e:
                 sentry_sdk.capture_exception(e)
                 logger.error(f"Cartesia stream error: {e}")
                 return  # exhaust generator cleanly; client gets a partial/empty response
+            # Charge ONLY for audio we actually delivered. Runs after the last byte.
+            if streamed_ok:
+                try:
+                    _deduct_credits(_tts_user_key, tts_credits, feature="tts",
+                                    idempotency_key=tts_idem, provider="cartesia",
+                                    output_units=len(text), raw_cost_usd=tts_raw_cost)
+                except Exception as _e:
+                    logger.error(f"TTS credit deduction failed (non-fatal): {_e}")
 
         _track_usage(_tts_user_key, data.get("userEmail", ""), "cartesia_tts",
-                     len(text), len(text) * 0.0000001)
+                     len(text), tts_raw_cost)
         return StreamingResponse(cartesia_stream(), media_type="audio/mpeg")
 
     # Cartesia unavailable — return text-only; client handles graceful degradation
@@ -1785,7 +1884,8 @@ async def brief_url(request: Request, data: dict):
     if tier not in BRIEFING_TIER_CREDITS:
         tier = "deep_brief"
 
-    credits_cost = BRIEFING_TIER_CREDITS[tier]
+    # NOTE: brief is now METERED (real Jina fetch + Groq-70B token cost), charged after
+    # generation below. BRIEFING_TIER_CREDITS is kept ONLY to validate the tier name.
 
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
@@ -1897,6 +1997,8 @@ async def brief_url(request: Request, data: dict):
             temperature=0.4,
         )
         brief_text = groq_response.choices[0].message.content.strip()
+        brief_pt = getattr(groq_response.usage, "prompt_tokens", 0) or 0
+        brief_ct = getattr(groq_response.usage, "completion_tokens", 0) or 0
         _track_usage(user_id, user_email, "groq_llm",
                      len(brief_text), len(brief_text) / 4 * 0.0000008,
                      json.dumps({"tier": tier}))
@@ -1914,13 +2016,22 @@ async def brief_url(request: Request, data: dict):
     # FIX 6: cache brief text so it survives a page refresh within the session
     _save_ctx_cache(user_id, brief_text)
 
-    # Step 3 — Deduct credits
+    # Step 3 — Metered billing: charge the REAL cost of this brief (Jina page fetch +
+    # Groq-70B tokens), not a flat tier price. Single source of truth = PROVIDER_RATES.
+    brief_raw_cost = _llm_cost_usd("llama-3.3-70b-versatile", brief_pt, brief_ct)
+    if not fallback_used:
+        brief_raw_cost += PROVIDER_RATES["jina_fetch"]["req"]
+    credits_cost = _cost_to_credits(brief_raw_cost)
     idem_key = hashlib.sha256(
         f"{user_id}:{url}:{tier}:{int(time.time() // 10)}".encode()
     ).hexdigest()
-    _deduct_credits(user_id, credits_cost, feature=f"briefing:{tier}", idempotency_key=idem_key)
+    _deduct_credits(user_id, credits_cost, feature=f"briefing:{tier}",
+                    idempotency_key=idem_key, provider="groq+jina",
+                    input_units=brief_pt, output_units=brief_ct,
+                    raw_cost_usd=brief_raw_cost)
 
-    logger.info(f"🔍 {tier} brief for {url} ({len(brief_text)} chars), {credits_cost} credits deducted")
+    logger.info(f"🔍 {tier} brief for {url} ({len(brief_text)} chars, raw ${brief_raw_cost:.6f}, "
+                f"pt={brief_pt} ct={brief_ct}) → {credits_cost} credits deducted")
     return {
         "brief_text":   brief_text,
         "brief":        brief_text,   # backwards compatibility
@@ -2575,8 +2686,8 @@ PLAN_MODES = {
     "founding_50": "payment",
 }
 
-# Plans that allow TTS audio whisper
-TTS_ALLOWED_PLANS = {"pro", "command", "operator", "founding_50"}
+# Plans that allow TTS audio whisper (Solo/echo added Jun 7 2026 — gets ~1 hr audio)
+TTS_ALLOWED_PLANS = {"echo", "pro", "command", "operator", "founding_50"}
 
 # Plans that allow URL briefing (Jina+Groq)
 BRIEFING_ALLOWED_PLANS = {"command", "operator", "founding_50"}
@@ -2657,9 +2768,21 @@ RATE_DELETE  = os.environ.get("RATE_LIMIT_DELETE",  "3/hour")
 
 @app.get("/export-data")
 @limiter.limit(RATE_EXPORT)
-async def export_data(request: Request, deviceId: str, userEmail: str = "anonymous"):
-    """Export all personal data for the requesting user as a downloadable JSON file."""
+async def export_data(request: Request, deviceId: str, userEmail: str = "anonymous", include: str = ""):
+    """Export selected personal data for the requesting user as a downloadable CSV file.
+
+    `include` is an optional comma-separated list of sections to export:
+    account, sessions, ledger, events. When omitted or empty, all sections
+    are exported (backward compatible with the original one-click export).
+    """
     user_id, account_id, resolved_email = _resolve_user(request, deviceId, userEmail)
+
+    # Parse requested sections — default to all when unspecified
+    ALL_SECTIONS = {"account", "sessions", "ledger", "events"}
+    wanted = {s.strip().lower() for s in include.split(",") if s.strip()}
+    wanted &= ALL_SECTIONS
+    if not wanted:
+        wanted = set(ALL_SECTIONS)
 
     # Unauthenticated requests still require a registered email to identify records
     if not account_id:
@@ -2693,101 +2816,92 @@ async def export_data(request: Request, deviceId: str, userEmail: str = "anonymo
     try:
         with engine.connect() as conn:
             # Account / credits
-            if account_id:
-                row = conn.execute(text("""
-                    SELECT balance, plan_type, total_used, reset_date, subscription_status
-                    FROM credits WHERE account_id = :aid OR user_id = :uid LIMIT 1
-                """), {"aid": account_id, "uid": user_id}).fetchone()
-            else:
-                row = conn.execute(text("""
-                    SELECT balance, plan_type, total_used, reset_date, subscription_status
-                    FROM credits WHERE user_id = :uid
-                """), {"uid": user_id}).fetchone()
-            if row:
-                account_info["plan"] = row[1]
-                account_info["credits_remaining"] = row[0]
-                account_info["credits_used_total"] = row[2]
-                account_info["credits_reset_date"] = row[3]
-                account_info["subscription_status"] = row[4]
+            if "account" in wanted:
+                if account_id:
+                    row = conn.execute(text("""
+                        SELECT balance, plan_type, total_used, reset_date, subscription_status
+                        FROM credits WHERE account_id = :aid OR user_id = :uid LIMIT 1
+                    """), {"aid": account_id, "uid": user_id}).fetchone()
+                else:
+                    row = conn.execute(text("""
+                        SELECT balance, plan_type, total_used, reset_date, subscription_status
+                        FROM credits WHERE user_id = :uid
+                    """), {"uid": user_id}).fetchone()
+                if row:
+                    account_info["plan"] = row[1]
+                    account_info["credits_remaining"] = row[0]
+                    account_info["credits_used_total"] = row[2]
+                    account_info["credits_reset_date"] = row[3]
+                    account_info["subscription_status"] = row[4]
 
-            # Preferences
-            if account_id:
-                row = conn.execute(text("""
-                    SELECT preference_text FROM preferences
-                    WHERE account_id = :aid OR user_id = :uid LIMIT 1
-                """), {"aid": account_id, "uid": user_id}).fetchone()
-            else:
-                row = conn.execute(text("""
-                    SELECT preference_text FROM preferences WHERE user_id = :uid
-                """), {"uid": user_id}).fetchone()
-            if row:
-                account_info["preferences"] = row[0]
+                # Preferences
+                if account_id:
+                    row = conn.execute(text("""
+                        SELECT preference_text FROM preferences
+                        WHERE account_id = :aid OR user_id = :uid LIMIT 1
+                    """), {"aid": account_id, "uid": user_id}).fetchone()
+                else:
+                    row = conn.execute(text("""
+                        SELECT preference_text FROM preferences WHERE user_id = :uid
+                    """), {"uid": user_id}).fetchone()
+                if row:
+                    account_info["preferences"] = row[0]
 
             # Session history
-            if account_id:
-                rows = conn.execute(text("""
-                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
-                    FROM session_history WHERE account_id = :aid OR user_id = :uid
-                    ORDER BY timestamp DESC
-                """), {"aid": account_id, "uid": user_id}).fetchall()
-            else:
-                rows = conn.execute(text("""
-                    SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
-                    FROM session_history WHERE user_id = :uid
-                    ORDER BY timestamp DESC
-                """), {"uid": user_id}).fetchall()
-            sessions_rows = [
-                [r[0], r[1], r[2], r[3], r[4], r[5], r[6]]
-                for r in rows
-            ]
+            if "sessions" in wanted:
+                if account_id:
+                    rows = conn.execute(text("""
+                        SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                        FROM session_history WHERE account_id = :aid OR user_id = :uid
+                        ORDER BY timestamp DESC
+                    """), {"aid": account_id, "uid": user_id}).fetchall()
+                else:
+                    rows = conn.execute(text("""
+                        SELECT session_id, role, persona, style, summary, timestamp, duration_seconds
+                        FROM session_history WHERE user_id = :uid
+                        ORDER BY timestamp DESC
+                    """), {"uid": user_id}).fetchall()
+                sessions_rows = [
+                    [r[0], r[1], r[2], r[3], r[4], r[5], r[6]]
+                    for r in rows
+                ]
 
             # Credit ledger
-            if account_id:
+            if "ledger" in wanted:
                 rows = conn.execute(text("""
                     SELECT id, amount, balance_after, operation_type, feature, created_at
                     FROM credit_ledger WHERE user_id = :uid
                     ORDER BY created_at DESC
                 """), {"uid": user_id}).fetchall()
-            else:
-                rows = conn.execute(text("""
-                    SELECT id, amount, balance_after, operation_type, feature, created_at
-                    FROM credit_ledger WHERE user_id = :uid
-                    ORDER BY created_at DESC
-                """), {"uid": user_id}).fetchall()
-            credit_ledger_rows = [
-                [r[0], r[1], r[2], r[3], r[4], r[5]]
-                for r in rows
-            ]
+                credit_ledger_rows = [
+                    [r[0], r[1], r[2], r[3], r[4], r[5]]
+                    for r in rows
+                ]
 
             # Usage events
-            if account_id:
+            if "events" in wanted:
                 rows = conn.execute(text("""
                     SELECT id, feature, provider, credits_charged, raw_cost_usd, status, created_at
                     FROM usage_events WHERE user_id = :uid
                     ORDER BY created_at DESC
                 """), {"uid": user_id}).fetchall()
-            else:
-                rows = conn.execute(text("""
-                    SELECT id, feature, provider, credits_charged, raw_cost_usd, status, created_at
-                    FROM usage_events WHERE user_id = :uid
-                    ORDER BY created_at DESC
-                """), {"uid": user_id}).fetchall()
-            usage_events_rows = [
-                [r[0], r[1], r[2], r[3], r[4], r[5], r[6]]
-                for r in rows
-            ]
+                usage_events_rows = [
+                    [r[0], r[1], r[2], r[3], r[4], r[5], r[6]]
+                    for r in rows
+                ]
 
-            # Founding member
-            if account_id:
-                row = conn.execute(text("""
-                    SELECT purchase_date FROM founding_members WHERE account_id = :aid OR user_id = :uid LIMIT 1
-                """), {"aid": account_id, "uid": user_id}).fetchone()
-            else:
-                row = conn.execute(text("""
-                    SELECT purchase_date FROM founding_members WHERE user_id = :uid
-                """), {"uid": user_id}).fetchone()
-            if row:
-                account_info["founding_member_since"] = row[0]
+            # Founding member (part of account section)
+            if "account" in wanted:
+                if account_id:
+                    row = conn.execute(text("""
+                        SELECT purchase_date FROM founding_members WHERE account_id = :aid OR user_id = :uid LIMIT 1
+                    """), {"aid": account_id, "uid": user_id}).fetchone()
+                else:
+                    row = conn.execute(text("""
+                        SELECT purchase_date FROM founding_members WHERE user_id = :uid
+                    """), {"uid": user_id}).fetchone()
+                if row:
+                    account_info["founding_member_since"] = row[0]
 
     except Exception as e:
         logger.error(f"export-data error for {user_id[:24]}…: {e}")
@@ -2798,31 +2912,35 @@ async def export_data(request: Request, deviceId: str, userEmail: str = "anonymo
     writer = csv.writer(buf)
 
     # Section 1: Account Info
-    writer.writerow(["# ACCOUNT INFO"])
-    writer.writerow(["field", "value"])
-    for field, value in account_info.items():
-        writer.writerow([field, value])
-    writer.writerow([])
+    if "account" in wanted:
+        writer.writerow(["# ACCOUNT INFO"])
+        writer.writerow(["field", "value"])
+        for field, value in account_info.items():
+            writer.writerow([field, value])
+        writer.writerow([])
 
     # Section 2: Sessions
-    writer.writerow(["# SESSIONS"])
-    writer.writerow(["session_id", "role", "mode", "style", "summary", "timestamp", "duration_seconds"])
-    for r in sessions_rows:
-        writer.writerow(r)
-    writer.writerow([])
+    if "sessions" in wanted:
+        writer.writerow(["# SESSIONS"])
+        writer.writerow(["session_id", "role", "mode", "style", "summary", "timestamp", "duration_seconds"])
+        for r in sessions_rows:
+            writer.writerow(r)
+        writer.writerow([])
 
     # Section 3: Credit Ledger
-    writer.writerow(["# CREDIT LEDGER"])
-    writer.writerow(["id", "amount", "balance_after", "operation_type", "feature", "created_at"])
-    for r in credit_ledger_rows:
-        writer.writerow(r)
-    writer.writerow([])
+    if "ledger" in wanted:
+        writer.writerow(["# CREDIT LEDGER"])
+        writer.writerow(["id", "amount", "balance_after", "operation_type", "feature", "created_at"])
+        for r in credit_ledger_rows:
+            writer.writerow(r)
+        writer.writerow([])
 
     # Section 4: Usage Events
-    writer.writerow(["# USAGE EVENTS"])
-    writer.writerow(["id", "feature", "provider", "credits_charged", "raw_cost_usd", "status", "created_at"])
-    for r in usage_events_rows:
-        writer.writerow(r)
+    if "events" in wanted:
+        writer.writerow(["# USAGE EVENTS"])
+        writer.writerow(["id", "feature", "provider", "credits_charged", "raw_cost_usd", "status", "created_at"])
+        for r in usage_events_rows:
+            writer.writerow(r)
 
     csv_content = buf.getvalue()
 
