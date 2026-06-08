@@ -12,7 +12,7 @@ import stripe
 from sqlalchemy import create_engine, text
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from deepgram import DeepgramClient
+from deepgram import DeepgramClient, PrerecordedOptions
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -546,8 +546,11 @@ def _process_onboarding_emails() -> None:
 # Cleared automatically when /end-session is called.
 # ========================
 
-def _save_ctx_cache(user_key: str, text: str) -> None:
-    if engine is None or not user_key or not text:
+def _save_ctx_cache(user_key: str, content: str) -> None:
+    # NOTE: param is named `content`, NOT `text` — `text` is sqlalchemy.text (line 12).
+    # Shadowing it here previously made every cache write raise "'str' object is not
+    # callable" and fail silently (caught below), so context never persisted.
+    if engine is None or not user_key or not content:
         return
     cache_id = f"{user_key}::ctx_cache"
     try:
@@ -558,7 +561,7 @@ def _save_ctx_cache(user_key: str, text: str) -> None:
                 ON CONFLICT (user_id) DO UPDATE SET
                     preference_text = EXCLUDED.preference_text,
                     updated_at      = EXCLUDED.updated_at
-            """), {"uid": cache_id, "txt": text, "now": datetime.utcnow().isoformat()})
+            """), {"uid": cache_id, "txt": content, "now": datetime.utcnow().isoformat()})
             conn.commit()
     except Exception as e:
         logger.warning(f"_save_ctx_cache failed: {e}")
@@ -1765,12 +1768,22 @@ async def quick_transcribe(
     if client is None:
         raise HTTPException(status_code=503, detail="STT service unavailable")
 
-    # Auth gate — caller must have a credits row with non-zero balance
+    # Auth gate — caller must be a KNOWN user (a credits row exists), regardless of
+    # balance. Previously this used _deduct_credits(user_key, 0)==0, which (a) wrongly
+    # rejected legit paid users sitting at exactly 0 balance and (b) INSERTed a zero
+    # credit_ledger row on every call (this endpoint fires frequently for continuation
+    # detection). A read-only SELECT avoids both.
     try:
         raw_user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
         user_key = _get_credits_user_id(raw_user_id, account_id)
-        if _deduct_credits(user_key, 0) == 0:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        if engine is not None:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT 1 FROM credits WHERE user_id=:uid"),
+                    {"uid": user_key}
+                ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=401, detail="Unauthorized")
     except HTTPException:
         raise
     except Exception:
@@ -2048,6 +2061,7 @@ async def brief_url(request: Request, data: dict):
 # ========================
 
 @app.get("/preferences")
+@limiter.limit(RATE_READS)
 async def get_preferences(request: Request, deviceId: str, userEmail: str = "anonymous"):
     if engine is None:
         return {"preference_text": ""}
@@ -2073,10 +2087,12 @@ async def get_preferences(request: Request, deviceId: str, userEmail: str = "ano
 
 
 @app.post("/preferences")
+@limiter.limit(RATE_READS)
 async def save_preferences(request: Request, data: dict):
     device_id = data.get("deviceId", "")
     user_email = data.get("userEmail", "anonymous")
-    preference_text = data.get("preference_text", "")
+    # Clamp to a sane length — unbounded preference_text is an abuse / row-growth vector.
+    preference_text = (data.get("preference_text", "") or "")[:8000]
 
     if engine is None:
         return {"status": "skipped"}
