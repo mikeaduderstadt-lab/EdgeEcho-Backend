@@ -1277,7 +1277,7 @@ async def transcribe(request: Request):
         raise
     except Exception as e:
         logger.error(f"❌ Deepgram transcribe error: {e}")
-        raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Transcription failed. Please try again.")
 
 
 @app.post("/coach")
@@ -1376,6 +1376,7 @@ async def coach(
                         "tts_allowed": tts_allowed,
                         "processing_time": round(time.time() - start_time, 3),
                         "audio_cap_reached": True,
+                        "code": "AUDIO_CAP_REACHED",
                         "message": "Monthly audio limit reached. Upgrade to Pro for unlimited audio.",
                     }
 
@@ -1563,7 +1564,7 @@ async def coach(
         logger.error(traceback.format_exc())
         if temp_filename and os.path.exists(temp_filename):
             os.unlink(temp_filename)
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Processing error. Please try again.")
 
 
 @app.post("/tts")
@@ -2018,7 +2019,7 @@ async def brief_url(request: Request, data: dict):
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"Groq brief generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Brief generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Brief generation failed. Please try again.")
 
     if fallback_used:
         brief_text = (
@@ -2776,7 +2777,7 @@ async def billing_portal(request: Request, data: dict):
         return {"url": portal_session.url}
     except stripe.StripeError as e:
         logger.error(f"Stripe billing portal error: {e}")
-        raise HTTPException(status_code=500, detail=f"Billing portal error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Could not open the billing portal. Please try again.")
 
 
 RATE_EXPORT  = os.environ.get("RATE_LIMIT_EXPORT",  "5/minute")
@@ -3172,7 +3173,7 @@ async def create_checkout(request: Request, data: dict):
         return {"url": session.url}
     except stripe.StripeError as e:
         logger.error(f"Stripe error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Could not start checkout. Please try again.")
 
 
 @app.post("/stripe-webhook")
@@ -4333,7 +4334,7 @@ async def admin_usage_summary(request: Request):
         }
     except Exception as e:
         logger.error(f"admin_usage_summary error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal error.")
 
 
 @app.get("/debug/prompts")
@@ -4468,7 +4469,7 @@ async def prep_session(request: Request, data: dict):
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"prep-session Groq error: {e}")
-        raise HTTPException(status_code=500, detail=f"Brief generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Brief generation failed. Please try again.")
 
     # Parse JSON; fall back to raw text in all fields if parse fails
     try:
@@ -4492,12 +4493,7 @@ async def prep_session(request: Request, data: dict):
     _deduct_credits(user_id, credits_cost, feature="prep_session", idempotency_key=idem_key)
 
     # Save to session_history with status='prepped'
-    new_session_id = str(uuid.uuid4()) if 'uuid' in dir() else __import__('uuid').uuid4().__str__()
-    try:
-        import uuid as _uuid
-        new_session_id = str(_uuid.uuid4())
-    except Exception:
-        pass
+    new_session_id = str(_uuid.uuid4())
 
     if engine is not None:
         try:
