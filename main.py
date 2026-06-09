@@ -37,6 +37,24 @@ _START_TIME = time.time()  # process start — used for uptime reporting in /hea
 load_dotenv()
 
 # ========================
+# WS4 — PERSISTENT CARTESIA HTTP CLIENT (keep-alive connection pool)
+# ========================
+# A fresh httpx.AsyncClient per /tts paid a full TCP+TLS handshake to Cartesia on
+# EVERY whisper (~100–200ms). One module-level pooled client reuses warm connections.
+# Safe to share across concurrent coroutines on a single event loop; each uvicorn
+# worker process gets its own. Only the per-request .stream(...) context is per-call.
+import httpx as _httpx
+_CARTESIA_LIMITS = _httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=300.0)
+_CARTESIA_TIMEOUT = _httpx.Timeout(connect=4.0, read=30.0, write=10.0, pool=5.0)
+_cartesia_client = None
+
+def _get_cartesia_client():
+    global _cartesia_client
+    if _cartesia_client is None or _cartesia_client.is_closed:
+        _cartesia_client = _httpx.AsyncClient(limits=_CARTESIA_LIMITS, timeout=_CARTESIA_TIMEOUT, http2=False)
+    return _cartesia_client
+
+# ========================
 # SENTRY ERROR TRACKING
 # ========================
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
@@ -1285,6 +1303,7 @@ async def transcribe(request: Request):
 async def coach(
     request: Request,
     transcript: str = Form(None),
+    whisper_seconds_in: float = Form(0.0),   # WS1: client-supplied STT duration for transcript-path billing
     audio: UploadFile = File(None),
     file: UploadFile = File(None),
     deviceId: str = Form(...),
@@ -1343,10 +1362,53 @@ async def coach(
     whisper_seconds = 0.0  # best-effort STT duration for metered billing
 
     try:
-        # --- Transcript path: pre-transcribed text provided by frontend (e.g. Deepgram streaming) ---
+        # --- Transcript path: pre-transcribed text provided by frontend ---
+        # WS1: the frontend reuses the /quick_transcribe text it already produced for
+        # continuation detection, so /coach skips a SECOND redundant Whisper pass.
+        # It passes the audio duration (whisper_seconds_in) so STT is still billed here
+        # exactly as the audio path would (previously the transcript path billed $0 STT).
         if transcript and transcript.strip():
             transcript = transcript.strip()
-            logger.info(f"📝 Using pre-transcribed text: {transcript[:80]}...")
+            # Clamp client-supplied duration (anti-abuse): [0, 7200] seconds.
+            whisper_seconds = max(0.0, min(float(whisper_seconds_in or 0.0), 7200.0))
+            logger.info(f"📝 Using pre-transcribed text ({whisper_seconds:.1f}s billed STT): {transcript[:80]}...")
+            # Echo plan audio hard cap (3600s/month) — MUST enforce here too. With WS1 most
+            # whispers take this transcript path, so without this check the audio-path cap
+            # (below) would rarely run and Echo users could blow past their ~1 hour.
+            if plan_type == "echo" and engine is not None:
+                try:
+                    with engine.connect() as _conn:
+                        _row = _conn.execute(
+                            text("SELECT audio_seconds_used FROM credits WHERE user_id=:uid"),
+                            {"uid": user_key}
+                        ).fetchone()
+                    _audio_used = _row[0] if _row else 0
+                except Exception as _e:
+                    logger.error(f"audio cap read error (transcript path): {_e}")
+                    _audio_used = 0
+                if _audio_used >= 3600:
+                    return {
+                        "answer": "Monthly audio limit reached. Upgrade to Pro for unlimited audio.",
+                        "transcript": "",
+                        "credits_remaining": credits["balance"],
+                        "tts_allowed": tts_allowed,
+                        "processing_time": round(time.time() - start_time, 3),
+                        "audio_cap_reached": True,
+                        "code": "AUDIO_CAP_REACHED",
+                        "message": "Monthly audio limit reached. Upgrade to Pro for unlimited audio.",
+                    }
+            # Count these seconds toward the cap, just like the audio path does.
+            if plan_type == "echo" and engine is not None and whisper_seconds > 0:
+                _audio_secs = max(1, round(whisper_seconds))
+                try:
+                    with engine.begin() as _conn:
+                        _conn.execute(text("""
+                            UPDATE credits
+                            SET audio_seconds_used = audio_seconds_used + :secs
+                            WHERE user_id = :uid
+                        """), {"secs": _audio_secs, "uid": user_key})
+                except Exception as _e:
+                    logger.error(f"audio_seconds increment error (transcript path): {_e}")
         else:
             # --- Audio path: run Groq Whisper STT ---
             actual_file = audio or file
@@ -1594,7 +1656,6 @@ async def text_to_speech(request: Request, data: dict):
 
     cartesia_api_key = os.environ.get("CARTESIA_API_KEY")
     if cartesia_api_key:
-        import httpx
         payload = {
             "model_id": "sonic-3",
             "transcript": text,
@@ -1625,17 +1686,19 @@ async def text_to_speech(request: Request, data: dict):
         async def cartesia_stream():
             streamed_ok = False
             try:
-                async with httpx.AsyncClient(timeout=30.0) as http:
-                    async with http.stream(
-                        "POST",
-                        "https://api.cartesia.ai/tts/bytes",
-                        headers=cartesia_headers,
-                        json=payload,
-                    ) as resp:
-                        resp.raise_for_status()
-                        logger.info("✅ Cartesia stream open")
-                        async for chunk in resp.aiter_bytes(chunk_size=512):
-                            yield chunk
+                # WS4: reuse the module-level keep-alive client (no per-request TLS handshake).
+                # Do NOT `async with` the shared client — only the .stream(...) context is per-request.
+                http = _get_cartesia_client()
+                async with http.stream(
+                    "POST",
+                    "https://api.cartesia.ai/tts/bytes",
+                    headers=cartesia_headers,
+                    json=payload,
+                ) as resp:
+                    resp.raise_for_status()
+                    logger.info("✅ Cartesia stream open")
+                    async for chunk in resp.aiter_bytes(chunk_size=512):
+                        yield chunk
                 streamed_ok = True
             except Exception as e:
                 sentry_sdk.capture_exception(e)
@@ -1658,6 +1721,26 @@ async def text_to_speech(request: Request, data: dict):
     logger.warning("⚠️ TTS unavailable: CARTESIA_API_KEY not set")
     raise HTTPException(status_code=503, detail="TTS service unavailable")
 
+
+# WS4 Change 4 — prewarm the Cartesia keep-alive pool at session start so the FIRST
+# whisper of a session does not pay the cold TCP+TLS handshake. Fire-and-forget.
+async def _prewarm_cartesia():
+    if not os.environ.get("CARTESIA_API_KEY"):
+        return
+    try:
+        await _get_cartesia_client().get("https://api.cartesia.ai/", timeout=4.0)
+        logger.info("🔥 Cartesia connection prewarmed")
+    except Exception as e:
+        logger.info(f"Cartesia prewarm skipped (non-fatal): {e}")
+
+
+@app.on_event("shutdown")
+async def _close_cartesia_client():
+    global _cartesia_client
+    if _cartesia_client is not None and not _cartesia_client.is_closed:
+        await _cartesia_client.aclose()
+
+
 @app.post("/session/start")
 @limiter.limit(RATE_READS)
 async def session_start(request: Request, data: dict):
@@ -1665,6 +1748,9 @@ async def session_start(request: Request, data: dict):
     user_email = data.get("userEmail", "anonymous")
 
     user_id, account_id, _ = _resolve_user(request, device_id, user_email)
+
+    # WS4: warm the Cartesia connection pool now (non-blocking) so the first whisper is fast.
+    asyncio.create_task(_prewarm_cartesia())
 
     summaries: list = []
     if engine is not None:
