@@ -1317,10 +1317,11 @@ async def coach(
     plan_type = credits["plan_type"]
     tts_allowed = plan_type in TTS_ALLOWED_PLANS
 
-    # Silently downgrade operator-only options for lower plans
-    if role in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
+    # Custom persona/style is allowed on Pro+Power+ (see CUSTOM_ALLOWED_PLANS);
+    # downgrade only for plans below that (Free/Solo).
+    if role in OPERATOR_ONLY_OPTIONS and plan_type not in CUSTOM_ALLOWED_PLANS:
         role = "Interview Coach"
-    if mode in OPERATOR_ONLY_OPTIONS and plan_type != "operator":
+    if mode in OPERATOR_ONLY_OPTIONS and plan_type not in CUSTOM_ALLOWED_PLANS:
         mode = "Diplomat"
 
     # Free plan: Quick + Standard only (no Full — long responses)
@@ -1407,9 +1408,11 @@ async def coach(
                          len(content), len(content) / 16000 / 2 * 0.0001)
 
             # ── Echo plan: increment audio seconds consumed ──
-            # WebM/Opus from browser MediaRecorder at ~128 kbps → ~16000 bytes/sec
+            # Count the SAME measure used for billing (whisper_seconds = len/32000)
+            # so the 3600s cap equals a real ~1 hour. Previously this used /16000,
+            # double-counting the stream so Echo users hit the "1 hour" cap at ~30 min.
             if plan_type == "echo" and engine is not None:
-                _audio_secs = max(1, round(len(content) / 16000))
+                _audio_secs = max(1, round(whisper_seconds))
                 try:
                     with engine.begin() as _conn:
                         _conn.execute(text("""
@@ -1530,8 +1533,11 @@ async def coach(
         )
         metered_credits = _cost_to_credits(raw_cost)
 
+        # Hash the FULL transcript (not the first 200 chars): two different short
+        # questions that share an opening could otherwise collide in the same 10s
+        # bucket, making the second response deduct nothing (delivered free).
         idem_key = hashlib.sha256(
-            f"{user_key}:{transcript[:200]}:{int(time.time() // 10)}".encode()
+            f"{user_key}:{hashlib.sha256(transcript.encode()).hexdigest()}:{int(time.time() // 10)}".encode()
         ).hexdigest()
         credits_remaining = _deduct_credits(
             user_key, metered_credits, feature=f"coach:{style}", idempotency_key=idem_key,
@@ -1876,13 +1882,6 @@ async def upload_context(
 # PERPLEXITY_API_KEY reserved for future use.
 # ========================
 
-BRIEFING_TIER_CREDITS = {
-    "quick_read": 5,
-    "deep_brief": 6,
-    "war_room":   7,
-}
-
-
 @app.post("/brief")
 @limiter.limit(RATE_BRIEF)
 async def brief_url(request: Request, data: dict):
@@ -1891,15 +1890,11 @@ async def brief_url(request: Request, data: dict):
     user_email   = data.get("userEmail", "anonymous")
     role         = (data.get("role", "")   or "General").strip()
     mode         = (data.get("mode", "")   or "Analyst").strip()
-    tier         = (data.get("tier", "deep_brief") or "deep_brief").strip()
+    # `tier` is accepted for backward compatibility but no longer branches behavior —
+    # there is one standard brief now. Cost is fully METERED (Jina + Groq-70B tokens).
+    tier         = "deep_brief"
     goal         = data.get("goal", "").strip()
     context_text = data.get("context_text", "").strip()
-
-    if tier not in BRIEFING_TIER_CREDITS:
-        tier = "deep_brief"
-
-    # NOTE: brief is now METERED (real Jina fetch + Groq-70B token cost), charged after
-    # generation below. BRIEFING_TIER_CREDITS is kept ONLY to validate the tier name.
 
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
@@ -1949,42 +1944,19 @@ async def brief_url(request: Request, data: dict):
             "(Direct page content unavailable — brief based on domain context only.)"
         )
 
-    # Step 2 — Build tier-appropriate Groq prompt
-    if tier == "quick_read":
-        sections_instruction = (
-            f"Build a brief with exactly these sections:\n"
-            f"SUMMARY (2-3 sentences)\n"
-            f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n\n"
-            f"Keep entire brief under 300 words. Be specific not generic."
-        )
-        max_tokens = 500
-    elif tier == "war_room":
-        sections_instruction = (
-            f"Build a structured pre-call intelligence brief with exactly these sections:\n"
-            f"SUMMARY (2-3 sentences)\n"
-            f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n"
-            f"LIKELY OBJECTIONS (3 objections this person or company might raise)\n"
-            f"RECOMMENDED ANGLES (3 tactical approaches given the {mode} mode)\n"
-            f"RISKS TO WATCH (2 things that could go wrong)\n"
-            f"OPENING LINE (one suggested opening line tailored to {role} and {mode})\n"
-            f"COMPETITOR INTELLIGENCE (if detectable from content, otherwise note 'Not detectable')\n"
-            f"NEGOTIATION LEVERAGE POINTS (3 specific leverage points)\n"
-            f"PSYCHOLOGICAL PROFILE (brief profile of likely counterpart based on content)\n\n"
-            f"Keep entire brief under 900 words. Be specific not generic."
-        )
-        max_tokens = 1400
-    else:  # deep_brief
-        sections_instruction = (
-            f"Build a structured pre-call intelligence brief with exactly these sections:\n"
-            f"SUMMARY (2-3 sentences)\n"
-            f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n"
-            f"LIKELY OBJECTIONS (3 objections this person or company might raise)\n"
-            f"RECOMMENDED ANGLES (3 tactical approaches given the {mode} mode)\n"
-            f"RISKS TO WATCH (2 things that could go wrong)\n"
-            f"OPENING LINE (one suggested opening line tailored to {role} and {mode})\n\n"
-            f"Keep entire brief under 600 words. Be specific not generic."
-        )
-        max_tokens = 900
+    # Step 2 — Build the Groq prompt. Single standard brief (the quick_read /
+    # war_room tiers were removed Jun 8 2026 — one consistent depth, metered cost).
+    sections_instruction = (
+        f"Build a structured pre-call intelligence brief with exactly these sections:\n"
+        f"SUMMARY (2-3 sentences)\n"
+        f"KEY FACTS (5 bullet points most relevant to a {role} conversation)\n"
+        f"LIKELY OBJECTIONS (3 objections this person or company might raise)\n"
+        f"RECOMMENDED ANGLES (3 tactical approaches given the {mode} mode)\n"
+        f"RISKS TO WATCH (2 things that could go wrong)\n"
+        f"OPENING LINE (one suggested opening line tailored to {role} and {mode})\n\n"
+        f"Keep entire brief under 600 words. Be specific not generic."
+    )
+    max_tokens = 900
 
     goal_prefix = (
         f"The user's goal for this session: {goal}\n\n"
@@ -2530,6 +2502,7 @@ async def billing_summary(request: Request, deviceId: str, userEmail: str = "ano
         "balance": 0,
         "plan_type": "free",
         "total_used": 0,
+        "payg_enabled": False,
         "subscription_status": "active",
         "credits_reset_date": None,
         "included_credits_per_cycle": PLAN_CREDITS["free"],
@@ -2550,7 +2523,7 @@ async def billing_summary(request: Request, deviceId: str, userEmail: str = "ano
             if account_id:
                 row = conn.execute(
                     text("""
-                        SELECT balance, plan_type, total_used, reset_date, subscription_status
+                        SELECT balance, plan_type, total_used, reset_date, subscription_status, payg_enabled
                         FROM credits WHERE account_id = :aid ORDER BY balance DESC LIMIT 1
                     """),
                     {"aid": account_id},
@@ -2558,7 +2531,7 @@ async def billing_summary(request: Request, deviceId: str, userEmail: str = "ano
             if row is None:
                 row = conn.execute(
                     text("""
-                        SELECT balance, plan_type, total_used, reset_date, subscription_status
+                        SELECT balance, plan_type, total_used, reset_date, subscription_status, payg_enabled
                         FROM credits WHERE user_id = :uid
                     """),
                     {"uid": user_id},
@@ -2569,6 +2542,7 @@ async def billing_summary(request: Request, deviceId: str, userEmail: str = "ano
                 out["total_used"] = int(row[2] or 0)
                 out["credits_reset_date"] = row[3]
                 out["subscription_status"] = (row[4] or "active").strip() or "active"
+                out["payg_enabled"] = bool(row[5])
                 out["included_credits_per_cycle"] = int(PLAN_CREDITS.get(out["plan_type"], PLAN_CREDITS["free"]))
 
             if account_id:
@@ -2712,8 +2686,11 @@ BRIEFING_ALLOWED_PLANS = {"command", "operator", "founding_50"}
 # Plans that get AI-generated session summaries
 SUMMARY_ALLOWED_PLANS = {"command", "operator", "founding_50"}
 
-# Custom role/persona requires Operator
+# Option names that are plan-gated (the "Custom" free-text persona/style).
 OPERATOR_ONLY_OPTIONS = {"Custom"}
+# Plans allowed to use the Custom persona/style (Jun 8 2026: opened to Pro+Power;
+# was Operator-only, which made Custom dead for every purchasable plan).
+CUSTOM_ALLOWED_PLANS = {"pro", "command", "operator", "founding_50"}
 
 @app.post("/billing-portal")
 @limiter.limit(RATE_CHECKOUT)
@@ -4382,10 +4359,9 @@ async def prep_session(request: Request, data: dict):
     user_email    = data.get("userEmail", "anonymous")
     role          = (data.get("role", "") or "General").strip()
     mode          = (data.get("mode", "") or "Analyst").strip()
-    tier          = (data.get("tier", "deep_brief") or "deep_brief").strip()
-
-    if tier not in BRIEFING_TIER_CREDITS:
-        tier = "deep_brief"
+    # `tier` accepted for backward compatibility but no longer branches behavior —
+    # one standard depth, cost fully METERED (Jina + Groq-70B tokens) below.
+    tier          = "deep_brief"
 
     user_id, account_id, _ = _resolve_user(request, device_id, user_email)
     user_id = _get_credits_user_id(user_id, account_id)
@@ -4449,13 +4425,14 @@ async def prep_session(request: Request, data: dict):
         f"Return ONLY valid JSON. No markdown code blocks. No extra text. Be specific not generic."
     )
 
-    credits_cost = BRIEFING_TIER_CREDITS.get(tier, 6)
-    if plan_info["balance"] < credits_cost and not plan_info.get("payg_enabled", False):
+    # Cost is metered (real Jina + Groq-70B tokens), known only after generation.
+    # Light pre-gate: reject up front only if the user is already out of credits
+    # and not on PAYG. The exact metered amount is deducted after the Groq call.
+    if plan_info["balance"] <= 0 and not plan_info.get("payg_enabled", False):
         raise HTTPException(status_code=402, detail={
             "code": "INSUFFICIENT_CREDITS",
             "message": "Insufficient credits for Pre-Call Setup.",
             "balance": plan_info["balance"],
-            "cost": credits_cost,
         })
 
     try:
@@ -4466,6 +4443,8 @@ async def prep_session(request: Request, data: dict):
             temperature=0.4,
         )
         raw = groq_response.choices[0].message.content.strip()
+        prep_pt = getattr(groq_response.usage, "prompt_tokens", 0) or 0
+        prep_ct = getattr(groq_response.usage, "completion_tokens", 0) or 0
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"prep-session Groq error: {e}")
@@ -4486,11 +4465,19 @@ async def prep_session(request: Request, data: dict):
             "plan": raw,
         }
 
-    # Deduct credits
+    # Metered billing: charge the REAL cost (Jina page fetch + Groq-70B tokens),
+    # not a flat tier price. Single source of truth = PROVIDER_RATES.
+    prep_raw_cost = _llm_cost_usd("llama-3.3-70b-versatile", prep_pt, prep_ct)
+    if jina_content:
+        prep_raw_cost += PROVIDER_RATES["jina_fetch"]["req"]
+    credits_cost = _cost_to_credits(prep_raw_cost)
     idem_key = hashlib.sha256(
         f"{user_id}:prep:{int(time.time() // 10)}".encode()
     ).hexdigest()
-    _deduct_credits(user_id, credits_cost, feature="prep_session", idempotency_key=idem_key)
+    _deduct_credits(user_id, credits_cost, feature="prep_session",
+                    idempotency_key=idem_key, provider="groq+jina",
+                    input_units=prep_pt, output_units=prep_ct,
+                    raw_cost_usd=prep_raw_cost)
 
     # Save to session_history with status='prepped'
     new_session_id = str(_uuid.uuid4())
