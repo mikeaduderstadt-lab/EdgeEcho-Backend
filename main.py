@@ -1519,20 +1519,6 @@ async def coach(
         )
 
         answer = completion.choices[0].message.content.strip()
-
-        # Free tier: cap response at 800 words to prevent abuse
-        if plan_type == "free":
-            words = len(answer.split())
-            if words > 800:
-                # Truncate to ~800 words, keep last sentence intact
-                truncated = " ".join(answer.split()[:800])
-                last_period = truncated.rfind(".")
-                if last_period > 600:  # Make sure we're not cutting too short
-                    answer = truncated[:last_period + 1]
-                else:
-                    answer = truncated + "…"
-                logger.info(f"⚙️ Free tier response capped: {words} words → {len(answer.split())} words")
-
         logger.info(f"✅ Full answer text ({len(answer)} chars): {answer[:100]}...")
         _track_usage(user_key, userEmail, "groq_llm",
                      len(answer), len(answer) / 4 * 0.0000008)
