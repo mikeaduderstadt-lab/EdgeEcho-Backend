@@ -204,7 +204,7 @@ except Exception as e:
 # CREDIT SYSTEM
 # ========================
 PLAN_CREDITS = {
-    "free":        60,       # one-time, never resets (text-only)
+    "free":        20,       # monthly reset, ~20 text-only Q&As/month (text-only, no audio)
     "echo":        4000,     # Solo $9.99/mo   ← STRIPE_PRICE_ECHO   (now incl. ~1 hr audio)
     "pro":         75000,    # Pro $29.99/mo   ← STRIPE_PRICE_PRO    (~20 hrs audio)
     "command":     150000,   # Power $59.99/mo ← STRIPE_PRICE_COMMAND (~40 hrs audio)
@@ -1519,6 +1519,20 @@ async def coach(
         )
 
         answer = completion.choices[0].message.content.strip()
+
+        # Free tier: cap response at 800 words to prevent abuse
+        if plan_type == "free":
+            words = len(answer.split())
+            if words > 800:
+                # Truncate to ~800 words, keep last sentence intact
+                truncated = " ".join(answer.split()[:800])
+                last_period = truncated.rfind(".")
+                if last_period > 600:  # Make sure we're not cutting too short
+                    answer = truncated[:last_period + 1]
+                else:
+                    answer = truncated + "…"
+                logger.info(f"⚙️ Free tier response capped: {words} words → {len(answer.split())} words")
+
         logger.info(f"✅ Full answer text ({len(answer)} chars): {answer[:100]}...")
         _track_usage(user_key, userEmail, "groq_llm",
                      len(answer), len(answer) / 4 * 0.0000008)
@@ -3524,7 +3538,7 @@ def _create_account_or_get(email: str) -> str:
 
 
 def _ensure_free_credits(account_id: str) -> None:
-    """Provision 60 free-tier credits for a newly verified account if none exist,
+    """Provision 20 free-tier credits for a newly verified account if none exist,
     and set a monthly reset_date so the cron refills them every 30 days.
 
     Idempotent — safe to call on every sign-in; only acts when the account has
@@ -3545,7 +3559,7 @@ def _ensure_free_credits(account_id: str) -> None:
             reset_date = (datetime.utcnow() + timedelta(days=30)).isoformat()
             conn.execute(text("""
                 INSERT INTO credits (user_id, account_id, balance, plan_type, total_used, reset_date)
-                VALUES (:uid, :aid, 60, 'free', 0, :reset)
+                VALUES (:uid, :aid, 20, 'free', 0, :reset)
                 ON CONFLICT (user_id) DO NOTHING
             """), {"uid": uid, "aid": account_id, "reset": reset_date})
             conn.commit()
