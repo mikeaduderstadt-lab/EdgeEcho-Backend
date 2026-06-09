@@ -12,7 +12,13 @@ import stripe
 from sqlalchemy import create_engine, text
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from deepgram import DeepgramClient, PrerecordedOptions
+try:
+    from deepgram import DeepgramClient, PrerecordedOptions
+except Exception as _deepgram_import_err:  # SDK API drift (e.g. v4 removed PrerecordedOptions) must never crash startup
+    import logging as _logging
+    _logging.warning(f"Deepgram SDK import failed, transcription disabled: {_deepgram_import_err}")
+    DeepgramClient = None
+    PrerecordedOptions = None
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
