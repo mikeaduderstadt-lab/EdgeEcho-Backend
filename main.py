@@ -1323,11 +1323,27 @@ async def coach(
     plan_type = credits["plan_type"]
     tts_allowed = plan_type in TTS_ALLOWED_PLANS
 
-    # Custom persona/style is allowed on Pro+Power+ (see CUSTOM_ALLOWED_PLANS);
-    # downgrade only for plans below that (Free/Solo).
-    if role in OPERATOR_ONLY_OPTIONS and plan_type not in CUSTOM_ALLOWED_PLANS:
+    # Custom persona/style gate (fixed Jun 11 2026). The frontend sends the user's
+    # typed custom text AS the role/mode value — it never literally sends "Custom".
+    # So: any non-preset value IS a custom persona/style. On CUSTOM_ALLOWED_PLANS it
+    # is wired into the dedicated custom_*_description fields (which is the only way
+    # build_system_prompt actually injects it — previously typed customs silently
+    # fell through to the default prompt for every plan). Below Pro it is downgraded.
+    if role not in ROLE_PROMPTS:
+        if role.strip() and plan_type in CUSTOM_ALLOWED_PLANS:
+            custom_role_description = (custom_role_description or role).strip()
+            role = "Custom"
+        else:
+            role = "Interview Coach"
+    elif role in OPERATOR_ONLY_OPTIONS and plan_type not in CUSTOM_ALLOWED_PLANS:
         role = "Interview Coach"
-    if mode in OPERATOR_ONLY_OPTIONS and plan_type not in CUSTOM_ALLOWED_PLANS:
+    if mode not in MODE_MODIFIERS:
+        if mode.strip() and plan_type in CUSTOM_ALLOWED_PLANS:
+            custom_mode_description = (custom_mode_description or mode).strip()
+            mode = "Custom"
+        else:
+            mode = "Diplomat"
+    elif mode in OPERATOR_ONLY_OPTIONS and plan_type not in CUSTOM_ALLOWED_PLANS:
         mode = "Diplomat"
 
     # Free plan: Quick + Standard only (no Full — long responses)
@@ -1845,6 +1861,15 @@ async def upload_context(
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
+    # Context uploads are a Solo-and-up feature (landing pricing card).
+    _uid, _aid, _ = _resolve_user(request, deviceId, userEmail)
+    _plan = _get_credit_balance(_get_credits_user_id(_uid, _aid))["plan_type"]
+    if _plan == "free":
+        raise HTTPException(status_code=403, detail={
+            "code": "PLAN_REQUIRED",
+            "message": "Context uploads are available on the Solo plan and above.",
+        })
+
     filename = file.filename.lower()
     content_type = (file.content_type or "").lower()
 
@@ -2234,6 +2259,10 @@ async def get_session_memory(request: Request, deviceId: str, userEmail: str = "
     if engine is None:
         return {"summaries": []}
     user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+    # Cross-session memory is a Pro-and-up feature (landing pricing card).
+    _plan = _get_credit_balance(_get_credits_user_id(user_id, account_id))["plan_type"]
+    if _plan not in {"pro", "command", "operator", "founding_50"}:
+        return {"summaries": []}
     try:
         with engine.connect() as conn:
             if account_id:
