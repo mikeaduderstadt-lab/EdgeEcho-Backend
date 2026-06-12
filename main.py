@@ -1133,6 +1133,30 @@ def _mark_event_processed(event_id: str, event_type: str) -> None:
 async def root():
     return {"status": "CerebroEcho Backend Live", "version": "1.2.0"}
 
+# ── TTS health tracking ──────────────────────────────────────────────────────
+# /tts records its last upstream failure here so /health can report TTS as degraded
+# WITHOUT making a paid probe call to Cartesia on every health check. A successful
+# stream open clears it. A failure is considered "current" for TTS_FAILURE_TTL_S.
+# This is what lets /health tell the truth about TTS (the old key-presence check
+# reported cartesia=true even when Cartesia returned 402 "credits exhausted").
+_tts_last_failure: dict | None = None
+TTS_FAILURE_TTL_S = 600  # 10 minutes
+
+def _record_tts_failure(status: int, detail: str) -> None:
+    global _tts_last_failure
+    _tts_last_failure = {"status": status, "detail": (detail or "")[:200], "at": time.time()}
+
+def _clear_tts_failure() -> None:
+    global _tts_last_failure
+    _tts_last_failure = None
+
+def _tts_recent_failure() -> dict | None:
+    f = _tts_last_failure
+    if f and (time.time() - f["at"]) <= TTS_FAILURE_TTL_S:
+        return f
+    return None
+
+
 @app.get("/health")
 async def health():
     """
@@ -1142,6 +1166,8 @@ async def health():
 
     Critical (affect HTTP status): db, groq, deepgram
     Non-critical (informational only): cartesia, stripe, resend
+    Note: `tts` reflects the REAL outcome of recent /tts calls (degrades on a
+    Cartesia upstream failure within the last 10 min); `cartesia` is key-presence only.
     """
     checks: dict = {}
 
@@ -1162,18 +1188,28 @@ async def health():
     # ── SDK clients (initialised at startup) ─────────────────────────────
     groq_ok     = client is not None
     deepgram_ok = deepgram_client is not None
-    tts_ok      = cartesia_client is not None
+    # TTS health = key configured AND no recent Cartesia upstream failure. This is
+    # the fix for the silent outage: previously tts_ok was key-presence only, so a
+    # 402 "credits exhausted" from Cartesia still reported tts=true.
+    tts_failure = _tts_recent_failure()
+    tts_ok      = (cartesia_client is not None) and (tts_failure is None)
 
     # ── API key presence (never expose values) ────────────────────────────
     checks.update({
         "db":          db_ok,
         "groq":        groq_ok,
         "deepgram":    deepgram_ok,
-        "tts":         tts_ok,
-        "cartesia":    cartesia_client is not None,
+        "tts":         tts_ok,                       # real recent /tts outcome
+        "cartesia":    cartesia_client is not None,  # key configured (presence only)
         "stripe":      bool(os.getenv("STRIPE_SECRET_KEY")),
         "resend":      bool(os.getenv("RESEND_API_KEY")),
     })
+    if tts_failure:
+        checks["tts_last_error"] = {
+            "upstream_status": tts_failure["status"],
+            "detail":          tts_failure["detail"],
+            "seconds_ago":     round(time.time() - tts_failure["at"]),
+        }
 
     healthy = db_ok and groq_ok and deepgram_ok
     uptime_s = round(time.time() - _START_TIME)
@@ -1642,29 +1678,72 @@ async def text_to_speech(request: Request, data: dict):
         ).hexdigest()
         logger.info(f"🎙️ Cartesia TTS sonic-3/24kHz voice={voice_id[:8]}… len={len(text)} → {tts_credits} cr (raw ${tts_raw_cost:.6f})")
 
-        # Async generator keeps FastAPI's event loop unblocked during the entire stream.
-        # 512-byte chunks deliver the first audio packet to the browser ~2× faster than 1024.
-        async def cartesia_stream():
-            streamed_ok = False
+        # ── Preflight the upstream BEFORE committing to a 200 stream ──
+        # StreamingResponse sends the status line the moment the generator starts
+        # iterating, so an upstream error discovered *inside* the generator could only
+        # ever yield an empty 200 (the silent-TTS bug: Cartesia 402 "credits exhausted"
+        # looked like a successful but empty audio response). By sending the request and
+        # validating its status HERE, a real failure surfaces to the client as a real
+        # error status — and the frontend's `if (!response.ok) throw` falls back to the
+        # text answer instead of silently playing nothing.
+        http = httpx.AsyncClient(timeout=30.0)
+        try:
+            req  = http.build_request("POST", "https://api.cartesia.ai/tts/bytes",
+                                      headers=cartesia_headers, json=payload)
+            resp = await http.send(req, stream=True)
+        except Exception as e:
+            await http.aclose()
+            sentry_sdk.capture_exception(e)
+            logger.error(f"Cartesia connection error: {e}")
+            _record_tts_failure(0, str(e)[:160])
+            raise HTTPException(status_code=502, detail={
+                "code": "TTS_UPSTREAM_UNAVAILABLE",
+                "message": "Voice generation is temporarily unavailable. Your response is shown as text.",
+            })
+
+        if resp.status_code != 200:
+            err_body = ""
             try:
-                async with httpx.AsyncClient(timeout=30.0) as http:
-                    async with http.stream(
-                        "POST",
-                        "https://api.cartesia.ai/tts/bytes",
-                        headers=cartesia_headers,
-                        json=payload,
-                    ) as resp:
-                        resp.raise_for_status()
-                        logger.info("✅ Cartesia stream open")
-                        async for chunk in resp.aiter_bytes(chunk_size=512):
-                            yield chunk
-                streamed_ok = True
+                err_body = (await resp.aread()).decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            await resp.aclose()
+            await http.aclose()
+            logger.error(f"Cartesia TTS upstream {resp.status_code}: {err_body}")
+            sentry_sdk.capture_message(f"Cartesia TTS upstream {resp.status_code}: {err_body}")
+            _record_tts_failure(resp.status_code, err_body)
+            # 402 = Cartesia model-credit limit reached (our account billing); 429 = rate limit.
+            # Neither is the user's fault, so report a clean 503 the client can degrade on.
+            if resp.status_code in (402, 429):
+                raise HTTPException(status_code=503, detail={
+                    "code": "TTS_CAPACITY_EXHAUSTED",
+                    "message": "Voice generation is temporarily unavailable. Your response is shown as text.",
+                    "upstream_status": resp.status_code,
+                })
+            raise HTTPException(status_code=502, detail={
+                "code": "TTS_UPSTREAM_ERROR",
+                "message": "Voice generation failed. Your response is shown as text.",
+                "upstream_status": resp.status_code,
+            })
+
+        logger.info("✅ Cartesia stream open (upstream 200)")
+        _clear_tts_failure()
+
+        # Upstream is healthy — stream the bytes to the client. 512-byte chunks deliver
+        # the first audio packet ~2× faster than 1024. Charge ONLY for delivered audio.
+        async def cartesia_stream():
+            streamed_any = False
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size=512):
+                    streamed_any = True
+                    yield chunk
             except Exception as e:
                 sentry_sdk.capture_exception(e)
-                logger.error(f"Cartesia stream error: {e}")
-                return  # exhaust generator cleanly; client gets a partial/empty response
-            # Charge ONLY for audio we actually delivered. Runs after the last byte.
-            if streamed_ok:
+                logger.error(f"Cartesia stream error mid-flight: {e}")
+            finally:
+                await resp.aclose()
+                await http.aclose()
+            if streamed_any:
                 try:
                     _deduct_credits(_tts_user_key, tts_credits, feature="tts",
                                     idempotency_key=tts_idem, provider="cartesia",
