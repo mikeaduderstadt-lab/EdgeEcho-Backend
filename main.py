@@ -2242,7 +2242,8 @@ async def end_session(request: Request, data: dict):
     can_summarize = plan_info["plan_type"] in SUMMARY_ALLOWED_PLANS
 
     summary = f"Session with {len(transcript)} exchanges."
-    full_transcript_json = None
+    # Always save the transcript so ANY session can be resumed later (ghost mode already returned above).
+    full_transcript_json = json.dumps(transcript)
 
     if client is not None and save_memory:
         history_text = "\n".join(
