@@ -96,7 +96,8 @@ app = FastAPI(title="CerebroEcho API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://cerebroecho.com", "https://www.cerebroecho.com", "https://cerebroecho-frontend.vercel.app"],
+    allow_origins=["https://cerebroecho.com", "https://www.cerebroecho.com", "https://cerebroecho-frontend.vercel.app",
+                   "https://hq.cerebroecho.com"],  # hq = standalone owner Command Center (separate app)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
