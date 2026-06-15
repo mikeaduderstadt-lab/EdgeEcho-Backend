@@ -14,3 +14,4 @@ pypdf>=3.0.0
 slowapi>=0.1.9
 resend>=2.0.0
 sentry-sdk[fastapi]>=2.0.0
+twilio>=9.0.0

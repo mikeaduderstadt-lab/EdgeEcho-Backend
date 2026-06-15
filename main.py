@@ -4685,6 +4685,28 @@ async def _startup_onboarding_worker():
     logger.info("✅ Onboarding email background worker started")
 
 
+# ── Telephony (Twilio Voice) ─────────────────────────────────────────────────
+# Inert until `twilio` is installed AND TWILIO_* env vars are set (see TELEPHONY_GOLIVE.md).
+# Wrapped so a telephony import/setup error can never stop the backend from booting.
+try:
+    from telephony import build_telephony_router, init_telephony_tables
+
+    def _telephony_resolve_user_id(request):
+        """Map an authed request -> credits user_id ('account_<id>'), or None."""
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        account_id, _email = _get_account_from_session(auth[7:].strip())
+        return f"account_{account_id}" if account_id else None
+
+    init_telephony_tables(engine)
+    app.include_router(build_telephony_router(
+        engine, _deduct_credits, _get_credit_balance, _telephony_resolve_user_id))
+    logger.info("✅ Telephony router mounted (inert unless TWILIO_* env vars set)")
+except Exception as _tel_e:
+    logger.warning(f"Telephony not mounted: {_tel_e}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
