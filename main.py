@@ -697,7 +697,7 @@ ROLE_PROMPTS = {
         "Do not editorialize."
     ),
     "Custom": """
-You are CerebroEcho in Custom Persona mode.
+You are operating in Custom Persona mode.
 The user has defined their own persona for this session. Apply the user's custom persona description as your primary behavioral directive. Adapt your coaching style, tactics, and responses to serve whatever scenario the user has defined. If no custom description was provided, default to general conversation intelligence — help the user navigate the conversation with clarity and confidence.
 """,
 }
@@ -799,6 +799,13 @@ def build_system_prompt(
 
     style_cfg = STYLE_CONFIG.get(style, STYLE_CONFIG["Standard"])
     parts.append(style_cfg["instruction"])
+    parts.append(
+        "STAY ON TOPIC: Anchor every suggestion to the CURRENT live conversation and respond directly "
+        "to what the other party just said. Do NOT introduce, pitch, or redirect toward a product, company, "
+        "brand, app, or agenda drawn from memory or prior context unless the other party has actually raised it "
+        "and it is directly relevant to what they are discussing right now. Treat any company/product names in "
+        "memory or prior context as background about the user only — never steer the conversation toward them."
+    )
     parts.append(
         "Return ONLY the answer the user should say. "
         "No preamble, no labels, no meta-commentary. Start directly with the answer."
