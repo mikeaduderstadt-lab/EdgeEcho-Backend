@@ -737,9 +737,9 @@ Respond in the voice of a classic cartoon pirate — bold, theatrical, colorful 
 }
 
 STYLE_CONFIG = {
-    "Quick":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
-    "Standard":  {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
-    "Full":      {"instruction": "Respond with complete, polished phrasing. Up to 2000 characters. Use when the moment requires a fully formed response.", "max_tokens": 550},
+    "Quick":     {"instruction": "LENGTH = QUICK: reply in ONE short sentence or two brief bullets — about 15–30 words. Surgical, no preamble.", "max_tokens": 80},
+    "Standard":  {"instruction": "LENGTH = STANDARD: reply in a balanced 2–4 sentences — roughly 40–80 words. Useful and complete, not a monologue.", "max_tokens": 220},
+    "Full":      {"instruction": "LENGTH = FULL: give a thorough, fully-developed answer — several sentences, roughly 120–220 words. Flesh out the reasoning and phrasing; do NOT be terse.", "max_tokens": 550},
     "Nudge":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
     "Brief":     {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
     "shorthand": {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters.", "max_tokens": 80},
