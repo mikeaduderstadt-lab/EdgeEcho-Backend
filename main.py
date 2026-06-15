@@ -3892,6 +3892,204 @@ def _resolve_user(request: Request, device_id: str = "", user_email: str = "anon
     return f"{device_id}_{user_email}", None, user_email
 
 
+# ════════════════════════════════════════════════════════════════════════
+# ADMIN DASHBOARD — owner-only metrics (the CEO dashboard)
+# Read-only. Gated to ADMIN_EMAILS via the caller's magic-link session.
+# Non-admins (and the unauthenticated) get 404 so the endpoint stays hidden.
+# Inert if ADMIN_EMAILS is unset → nobody is admin → always 404.
+# ════════════════════════════════════════════════════════════════════════
+ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+_admin_cache = {"data": None, "ts": 0.0}
+_ADMIN_CACHE_TTL_S = 30
+
+
+def _require_admin(request: Request) -> str:
+    """Return the admin email if the Bearer session belongs to an ADMIN_EMAILS account, else 404."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            account_id, email = _get_account_from_session(token)
+            if account_id and email and email.strip().lower() in ADMIN_EMAILS:
+                return email
+    raise HTTPException(status_code=404, detail="Not found")
+
+
+def _admin_db_metrics() -> dict:
+    """Signups, paying members, and provider-cost aggregates straight from Postgres."""
+    out = {
+        "signups": {"total": 0, "today": 0, "d7": 0, "d30": 0, "series": []},
+        "members": {"total_accounts": 0, "paying": 0, "by_plan": {}, "active_subs": 0, "payg_enabled": 0},
+        "cost":    {"today": 0.0, "d7": 0.0, "d30": 0.0, "all": 0.0, "by_provider": {}, "series": []},
+        "credits": {"issued_balance": 0, "total_used": 0},
+    }
+    if engine is None:
+        return out
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    d7    = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+    d30   = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+    try:
+        with engine.connect() as conn:
+            # ── Signups (accounts.created_at is ISO text → lexical compare is valid) ──
+            out["signups"]["total"] = conn.execute(text("SELECT COUNT(*) FROM accounts")).scalar() or 0
+            out["signups"]["today"] = conn.execute(text("SELECT COUNT(*) FROM accounts WHERE created_at >= :d"), {"d": today}).scalar() or 0
+            out["signups"]["d7"]    = conn.execute(text("SELECT COUNT(*) FROM accounts WHERE created_at >= :d"), {"d": d7}).scalar() or 0
+            out["signups"]["d30"]   = conn.execute(text("SELECT COUNT(*) FROM accounts WHERE created_at >= :d"), {"d": d30}).scalar() or 0
+            rows = conn.execute(text("""
+                SELECT SUBSTRING(created_at, 1, 10) AS day, COUNT(*)
+                FROM accounts WHERE created_at >= :d
+                GROUP BY day ORDER BY day
+            """), {"d": d30}).fetchall()
+            out["signups"]["series"] = [{"day": r[0], "count": int(r[1])} for r in rows]
+
+            # ── Members / plans ──
+            out["members"]["total_accounts"] = conn.execute(text("SELECT COUNT(*) FROM credits")).scalar() or 0
+            out["members"]["paying"]         = conn.execute(text("SELECT COUNT(*) FROM credits WHERE plan_type <> 'free'")).scalar() or 0
+            out["members"]["active_subs"]    = conn.execute(text("SELECT COUNT(*) FROM credits WHERE plan_type <> 'free' AND subscription_status = 'active'")).scalar() or 0
+            try:
+                out["members"]["payg_enabled"] = conn.execute(text("SELECT COUNT(*) FROM credits WHERE payg_enabled = true")).scalar() or 0
+            except Exception:
+                pass  # payg_enabled column may not exist on older DBs
+            plan_rows = conn.execute(text("SELECT plan_type, COUNT(*) FROM credits GROUP BY plan_type ORDER BY 2 DESC")).fetchall()
+            out["members"]["by_plan"] = {(r[0] or "unknown"): int(r[1]) for r in plan_rows}
+            crow = conn.execute(text("SELECT COALESCE(SUM(balance),0), COALESCE(SUM(total_used),0) FROM credits")).fetchone()
+            if crow:
+                out["credits"]["issued_balance"] = int(crow[0])
+                out["credits"]["total_used"]     = int(crow[1])
+
+            # ── Provider cost (usage_events.created_at is TIMESTAMPTZ) ──
+            out["cost"]["today"] = float(conn.execute(text("SELECT COALESCE(SUM(raw_cost_usd),0) FROM usage_events WHERE created_at >= DATE_TRUNC('day', NOW())")).scalar() or 0)
+            out["cost"]["d7"]    = float(conn.execute(text("SELECT COALESCE(SUM(raw_cost_usd),0) FROM usage_events WHERE created_at >= NOW() - INTERVAL '7 days'")).scalar() or 0)
+            out["cost"]["d30"]   = float(conn.execute(text("SELECT COALESCE(SUM(raw_cost_usd),0) FROM usage_events WHERE created_at >= NOW() - INTERVAL '30 days'")).scalar() or 0)
+            out["cost"]["all"]   = float(conn.execute(text("SELECT COALESCE(SUM(raw_cost_usd),0) FROM usage_events")).scalar() or 0)
+            prov = conn.execute(text("SELECT provider, COALESCE(SUM(raw_cost_usd),0) FROM usage_events WHERE created_at >= NOW() - INTERVAL '30 days' GROUP BY provider ORDER BY 2 DESC")).fetchall()
+            out["cost"]["by_provider"] = {(r[0] or "unknown"): round(float(r[1]), 4) for r in prov}
+            crows = conn.execute(text("""
+                SELECT TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') AS day, COALESCE(SUM(raw_cost_usd),0)
+                FROM usage_events WHERE created_at >= NOW() - INTERVAL '30 days'
+                GROUP BY day ORDER BY day
+            """)).fetchall()
+            out["cost"]["series"] = [{"day": r[0], "cost": round(float(r[1]), 4)} for r in crows]
+    except Exception as e:
+        logger.error(f"admin db metrics error: {e}")
+    return out
+
+
+def _admin_stripe_metrics() -> dict:
+    """Earnings (MRR), recent gross, and refunds from Stripe. Best-effort; never raises."""
+    out = {"configured": False, "mrr": 0.0, "active_subscriptions": 0, "gross_30d": 0.0,
+           "refunds_30d": 0.0, "refund_count_30d": 0, "currency": "usd", "recent": []}
+    stripe_key = os.environ.get("STRIPE_SECRET_KEY")
+    if not stripe_key:
+        return out
+    out["configured"] = True
+    try:
+        stripe.api_key = stripe_key
+        # MRR from active subscriptions, normalized to a monthly figure
+        mrr = 0.0
+        sub_count = 0
+        for s in stripe.Subscription.list(status="active", limit=100).auto_paging_iter():
+            sub_count += 1
+            for it in s["items"]["data"]:
+                price    = it.get("price") or {}
+                amt      = (price.get("unit_amount") or 0) / 100.0
+                qty      = it.get("quantity", 1) or 1
+                interval = (price.get("recurring") or {}).get("interval", "month")
+                factor   = {"month": 1, "year": 1 / 12, "week": 52 / 12, "day": 365 / 12}.get(interval, 1)
+                mrr += amt * qty * factor
+        out["mrr"] = round(mrr, 2)
+        out["active_subscriptions"] = sub_count
+
+        since = int((datetime.utcnow() - timedelta(days=30)).timestamp())
+        # Gross succeeded charges (30d) + a few recent ones for the activity feed
+        gross = 0.0
+        recent = []
+        for c in stripe.Charge.list(created={"gte": since}, limit=100).auto_paging_iter():
+            if c.get("paid") and c.get("status") == "succeeded":
+                amt = (c.get("amount") or 0) / 100.0
+                gross += amt
+                if len(recent) < 12:
+                    recent.append({"type": "charge", "amount": round(amt, 2),
+                                   "email": (c.get("billing_details") or {}).get("email"),
+                                   "created": c.get("created")})
+        out["gross_30d"] = round(gross, 2)
+        out["recent"] = recent
+
+        # Refunds (30d)
+        ref_total = 0.0
+        ref_count = 0
+        for r in stripe.Refund.list(created={"gte": since}, limit=100).auto_paging_iter():
+            ref_total += (r.get("amount") or 0) / 100.0
+            ref_count += 1
+        out["refunds_30d"] = round(ref_total, 2)
+        out["refund_count_30d"] = ref_count
+    except Exception as e:
+        logger.error(f"admin stripe metrics error: {e}")
+    return out
+
+
+async def _admin_visitor_metrics() -> dict:
+    """Plausible site visitors. Inert unless PLAUSIBLE_API_KEY is set."""
+    out = {"configured": False, "realtime": None, "visitors_30d": None, "pageviews_30d": None, "site": None}
+    key  = os.environ.get("PLAUSIBLE_API_KEY")
+    site = os.environ.get("PLAUSIBLE_SITE_ID", "cerebroecho.com")
+    if not key:
+        return out
+    out["configured"] = True
+    out["site"] = site
+    try:
+        import httpx
+        headers = {"Authorization": f"Bearer {key}"}
+        base = "https://plausible.io/api/v1/stats"
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as h:
+            rt = await h.get(f"{base}/realtime/visitors", params={"site_id": site})
+            if rt.status_code == 200:
+                out["realtime"] = rt.json()
+            agg = await h.get(f"{base}/aggregate", params={"site_id": site, "period": "30d", "metrics": "visitors,pageviews"})
+            if agg.status_code == 200:
+                res = agg.json().get("results", {})
+                out["visitors_30d"]  = (res.get("visitors")  or {}).get("value")
+                out["pageviews_30d"] = (res.get("pageviews") or {}).get("value")
+    except Exception as e:
+        logger.error(f"admin visitor metrics error: {e}")
+    return out
+
+
+@app.get("/admin/metrics")
+@limiter.limit(RATE_READS)
+async def admin_metrics(request: Request):
+    admin_email = _require_admin(request)
+    now = time.time()
+    if _admin_cache["data"] is not None and (now - _admin_cache["ts"]) < _ADMIN_CACHE_TTL_S:
+        cached = dict(_admin_cache["data"])
+        cached["cached"] = True
+        return cached
+
+    db       = _admin_db_metrics()
+    stripe_m = _admin_stripe_metrics()
+    visitors = await _admin_visitor_metrics()
+
+    # Profit (30d) = Stripe gross − provider cost. Both best-effort.
+    profit_30d = round((stripe_m.get("gross_30d") or 0.0) - (db["cost"].get("d30") or 0.0), 2)
+
+    payload = {
+        "ok": True,
+        "admin_email": admin_email,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "signups":  db["signups"],
+        "members":  db["members"],
+        "credits":  db["credits"],
+        "cost":     db["cost"],
+        "revenue":  stripe_m,
+        "visitors": visitors,
+        "profit_30d": profit_30d,
+        "cached": False,
+    }
+    _admin_cache["data"] = payload
+    _admin_cache["ts"]   = now
+    return payload
+
+
 @app.post("/save_email")
 async def save_email(data: dict):
     device_id = data.get("deviceId")
