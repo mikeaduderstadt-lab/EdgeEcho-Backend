@@ -3916,11 +3916,33 @@ def _require_admin(request: Request) -> str:
     raise HTTPException(status_code=404, detail="Not found")
 
 
+# Accounts excluded from "real customer" metrics so the dashboard reflects true traction,
+# not test/QA/owner logins. Test domains are ALWAYS excluded; INTERNAL_EMAILS (owner's own
+# logins) is overridable via the INTERNAL_EMAILS env var (comma-separated).
+_METRICS_TEST_DOMAINS = ("example.com", "cerebroecho.test")
+INTERNAL_EMAILS = {e.strip().lower() for e in os.environ.get(
+    "INTERNAL_EMAILS",
+    "mikeaduderstadt@gmail.com,admin@cerebroecho.com,cerebroecho@gmail.com,mikemacmany@msn.com",
+).split(",") if e.strip()}
+
+
+def _real_accounts_filter(alias: str = "a"):
+    """SQL WHERE fragment (+bind params) keeping only real external accounts —
+    excludes test-domain emails and owner/internal logins. Returns (sql, params)."""
+    conds = [f"LOWER({alias}.email) NOT LIKE '%@{d}'" for d in _METRICS_TEST_DOMAINS]
+    params: dict = {}
+    for i, em in enumerate(sorted(INTERNAL_EMAILS)):
+        conds.append(f"LOWER({alias}.email) <> :ie{i}")
+        params[f"ie{i}"] = em
+    return ("(" + " AND ".join(conds) + ")") if conds else "TRUE", params
+
+
 def _admin_db_metrics() -> dict:
-    """Signups, paying members, and provider-cost aggregates straight from Postgres."""
+    """Signups, paying members, and provider-cost aggregates straight from Postgres.
+    Customer counts exclude test/QA/owner accounts (see _real_accounts_filter)."""
     out = {
         "signups": {"total": 0, "today": 0, "d7": 0, "d30": 0, "series": []},
-        "members": {"total_accounts": 0, "paying": 0, "by_plan": {}, "active_subs": 0, "payg_enabled": 0},
+        "members": {"total_accounts": 0, "paying": 0, "by_plan": {}, "active_subs": 0, "payg_enabled": 0, "excluded_test": 0},
         "cost":    {"today": 0.0, "d7": 0.0, "d30": 0.0, "all": 0.0, "by_provider": {}, "series": []},
         "credits": {"issued_balance": 0, "total_used": 0},
     }
@@ -3931,27 +3953,34 @@ def _admin_db_metrics() -> dict:
     d30   = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
     try:
         with engine.connect() as conn:
-            # ── Signups (accounts.created_at is ISO text → lexical compare is valid) ──
-            out["signups"]["total"] = conn.execute(text("SELECT COUNT(*) FROM accounts")).scalar() or 0
-            out["signups"]["today"] = conn.execute(text("SELECT COUNT(*) FROM accounts WHERE created_at >= :d"), {"d": today}).scalar() or 0
-            out["signups"]["d7"]    = conn.execute(text("SELECT COUNT(*) FROM accounts WHERE created_at >= :d"), {"d": d7}).scalar() or 0
-            out["signups"]["d30"]   = conn.execute(text("SELECT COUNT(*) FROM accounts WHERE created_at >= :d"), {"d": d30}).scalar() or 0
-            rows = conn.execute(text("""
-                SELECT SUBSTRING(created_at, 1, 10) AS day, COUNT(*)
-                FROM accounts WHERE created_at >= :d
+            # ── Signups — REAL external accounts only (exclude test/QA/owner) ──
+            # accounts.created_at is ISO text → lexical compare is valid.
+            rf, rp = _real_accounts_filter("a")
+            out["signups"]["total"] = conn.execute(text(f"SELECT COUNT(*) FROM accounts a WHERE {rf}"), rp).scalar() or 0
+            out["signups"]["today"] = conn.execute(text(f"SELECT COUNT(*) FROM accounts a WHERE {rf} AND a.created_at >= :d"), {**rp, "d": today}).scalar() or 0
+            out["signups"]["d7"]    = conn.execute(text(f"SELECT COUNT(*) FROM accounts a WHERE {rf} AND a.created_at >= :d"), {**rp, "d": d7}).scalar() or 0
+            out["signups"]["d30"]   = conn.execute(text(f"SELECT COUNT(*) FROM accounts a WHERE {rf} AND a.created_at >= :d"), {**rp, "d": d30}).scalar() or 0
+            rows = conn.execute(text(f"""
+                SELECT SUBSTRING(a.created_at, 1, 10) AS day, COUNT(*)
+                FROM accounts a WHERE {rf} AND a.created_at >= :d
                 GROUP BY day ORDER BY day
-            """), {"d": d30}).fetchall()
+            """), {**rp, "d": d30}).fetchall()
             out["signups"]["series"] = [{"day": r[0], "count": int(r[1])} for r in rows]
 
-            # ── Members / plans ──
-            out["members"]["total_accounts"] = conn.execute(text("SELECT COUNT(*) FROM credits")).scalar() or 0
-            out["members"]["paying"]         = conn.execute(text("SELECT COUNT(*) FROM credits WHERE plan_type <> 'free'")).scalar() or 0
-            out["members"]["active_subs"]    = conn.execute(text("SELECT COUNT(*) FROM credits WHERE plan_type <> 'free' AND subscription_status = 'active'")).scalar() or 0
+            # ── Members / plans — REAL paying customers only ──
+            # Join billing→accounts (handles the legacy 'account_<id>' key form). Rows that don't
+            # map to a real non-test account (orphan/seed rows, anonymous trials) are dropped.
+            _acct_join = "JOIN accounts a ON (c.user_id = a.id OR c.user_id = 'account_' || a.id)"
+            raw_total = conn.execute(text("SELECT COUNT(*) FROM accounts")).scalar() or 0
+            out["members"]["total_accounts"] = out["signups"]["total"]
+            out["members"]["excluded_test"]  = raw_total - out["signups"]["total"]
+            out["members"]["paying"]      = conn.execute(text(f"SELECT COUNT(*) FROM credits c {_acct_join} WHERE c.plan_type <> 'free' AND {rf}"), rp).scalar() or 0
+            out["members"]["active_subs"] = conn.execute(text(f"SELECT COUNT(*) FROM credits c {_acct_join} WHERE c.plan_type <> 'free' AND c.subscription_status = 'active' AND {rf}"), rp).scalar() or 0
             try:
-                out["members"]["payg_enabled"] = conn.execute(text("SELECT COUNT(*) FROM credits WHERE payg_enabled = true")).scalar() or 0
+                out["members"]["payg_enabled"] = conn.execute(text(f"SELECT COUNT(*) FROM credits c {_acct_join} WHERE c.payg_enabled = true AND {rf}"), rp).scalar() or 0
             except Exception:
                 pass  # payg_enabled column may not exist on older DBs
-            plan_rows = conn.execute(text("SELECT plan_type, COUNT(*) FROM credits GROUP BY plan_type ORDER BY 2 DESC")).fetchall()
+            plan_rows = conn.execute(text(f"SELECT c.plan_type, COUNT(*) FROM credits c {_acct_join} WHERE {rf} GROUP BY c.plan_type ORDER BY 2 DESC"), rp).fetchall()
             out["members"]["by_plan"] = {(r[0] or "unknown"): int(r[1]) for r in plan_rows}
             crow = conn.execute(text("SELECT COALESCE(SUM(balance),0), COALESCE(SUM(total_used),0) FROM credits")).fetchone()
             if crow:
