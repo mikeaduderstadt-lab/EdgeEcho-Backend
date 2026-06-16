@@ -2661,6 +2661,84 @@ async def get_session_history(request: Request, deviceId: str, userEmail: str = 
         return {"sessions": []}
 
 
+@app.get("/prep-history")
+@limiter.limit(RATE_READS)
+async def get_prep_history(request: Request, deviceId: str, userEmail: str = "anonymous"):
+    if engine is None:
+        return {"briefings": [], "results": []}
+    user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+    try:
+        with engine.connect() as conn:
+            if account_id:
+                brief_rows = conn.execute(text("""
+                    SELECT session_id, session_name, session_title, prep_goal, briefing_result,
+                           prep_notes, role, persona, timestamp
+                    FROM session_history
+                    WHERE (account_id = :aid OR user_id = :uid) AND status = 'prepped'
+                    ORDER BY timestamp DESC LIMIT 50
+                """), {"aid": account_id, "uid": user_id}).fetchall()
+                result_rows = conn.execute(text("""
+                    SELECT session_id, session_title, summary, role, persona, timestamp,
+                           duration_seconds, full_transcript
+                    FROM session_history
+                    WHERE (account_id = :aid OR user_id = :uid)
+                      AND status IS DISTINCT FROM 'prepped'
+                      AND (summary IS NOT NULL OR full_transcript IS NOT NULL)
+                    ORDER BY timestamp DESC LIMIT 50
+                """), {"aid": account_id, "uid": user_id}).fetchall()
+            else:
+                brief_rows = conn.execute(text("""
+                    SELECT session_id, session_name, session_title, prep_goal, briefing_result,
+                           prep_notes, role, persona, timestamp
+                    FROM session_history
+                    WHERE user_id = :uid AND status = 'prepped'
+                    ORDER BY timestamp DESC LIMIT 50
+                """), {"uid": user_id}).fetchall()
+                result_rows = conn.execute(text("""
+                    SELECT session_id, session_title, summary, role, persona, timestamp,
+                           duration_seconds, full_transcript
+                    FROM session_history
+                    WHERE user_id = :uid
+                      AND status IS DISTINCT FROM 'prepped'
+                      AND (summary IS NOT NULL OR full_transcript IS NOT NULL)
+                    ORDER BY timestamp DESC LIMIT 50
+                """), {"uid": user_id}).fetchall()
+
+        briefings = []
+        for r in brief_rows:
+            bres = r[4]
+            brief = bres if isinstance(bres, dict) else (json.loads(bres) if bres else None)
+            briefings.append({
+                "session_id": r[0],
+                "session_name": r[1],
+                "session_title": r[2],
+                "prep_goal": r[3],
+                "briefing": brief,
+                "prep_notes": r[5],
+                "role": r[6],
+                "mode": r[7],
+                "timestamp": r[8],
+            })
+
+        results = [
+            {
+                "session_id": r[0],
+                "session_title": r[1],
+                "summary": r[2],
+                "role": r[3],
+                "mode": r[4],
+                "timestamp": r[5],
+                "duration_seconds": r[6],
+                "has_transcript": r[7] is not None,
+            }
+            for r in result_rows
+        ]
+        return {"briefings": briefings, "results": results}
+    except Exception as e:
+        logger.error(f"get_prep_history error: {e}")
+        return {"briefings": [], "results": []}
+
+
 @app.patch("/session/{session_id}/rename")
 @limiter.limit(RATE_READS)
 async def rename_session(session_id: str, request: Request, data: dict):
