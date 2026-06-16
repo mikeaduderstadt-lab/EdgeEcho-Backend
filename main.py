@@ -4921,6 +4921,13 @@ async def prep_session(request: Request, data: dict):
     session_name  = (data.get("session_name", "") or "").strip()
     goal          = (data.get("goal", "") or "").strip()
     url           = (data.get("url", "") or "").strip()
+    # Accept a list of links (`urls`); fall back to the single legacy `url`. De-dupe, keep order.
+    _raw_urls     = data.get("urls")
+    if isinstance(_raw_urls, list):
+        urls = [(u or "").strip() for u in _raw_urls if (u or "").strip()]
+    else:
+        urls = [url] if url else []
+    urls = list(dict.fromkeys(urls))
     file_content  = (data.get("file_content", "") or "").strip()
     device_id     = data.get("deviceId", "")
     user_email    = data.get("userEmail", "anonymous")
@@ -4941,39 +4948,43 @@ async def prep_session(request: Request, data: dict):
             "required_plan": "pro",
         })
 
-    if url and plan_info["plan_type"] not in BRIEFING_ALLOWED_PLANS:
-        url = ""  # silently drop URL for plans below command
+    if urls and plan_info["plan_type"] not in BRIEFING_ALLOWED_PLANS:
+        urls = []  # silently drop URLs for plans below command
 
-    # Fetch URL content if provided
-    jina_content = ""
-    fallback_used = False
-    if url:
-        if not (url.startswith("http://") or url.startswith("https://")):
-            url = ""
-        elif any(b in url.lower() for b in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.", "10.", "192.168.", "172.16.")):
-            url = ""
-        else:
-            try:
-                import httpx as _httpx
-                async with _httpx.AsyncClient() as _jina_http:
+    # Validate (reject non-http(s) + private/localhost) and cap how many links we research.
+    def _valid_brief_url(u):
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return False
+        if any(b in u.lower() for b in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.", "10.", "192.168.", "172.16.")):
+            return False
+        return True
+
+    urls = [u for u in urls if _valid_brief_url(u)][:5]  # cap at 5 links per brief
+    # Split the content budget across links so many links don't blow up the prompt/cost.
+    per_url_chars = 12000 if len(urls) <= 1 else max(3000, 24000 // max(1, len(urls)))
+
+    # Fetch each URL's content (best-effort: a failed fetch falls back to domain context).
+    material_parts = []
+    jina_fetches = 0  # count successful page fetches for metered billing below
+    if urls:
+        import httpx as _httpx
+        async with _httpx.AsyncClient() as _jina_http:
+            for u in urls:
+                try:
                     jina_resp = await _jina_http.get(
-                        f"https://r.jina.ai/{url}",
+                        f"https://r.jina.ai/{u}",
                         headers={"Accept": "text/plain"},
                         follow_redirects=True,
                         timeout=20.0,
                     )
-                if jina_resp.status_code == 200 and jina_resp.text.strip():
-                    jina_content = jina_resp.text[:12000]
-            except Exception as e:
-                logger.warning(f"Jina fetch failed for {url}: {e}")
-                fallback_used = True
-
-    # Build material from all sources
-    material_parts = []
-    if jina_content:
-        material_parts.append(f"URL Content ({url}):\n{jina_content}")
-    elif url and fallback_used:
-        material_parts.append(f"URL: {url}\n(Direct page content unavailable — brief based on domain context only.)")
+                    if jina_resp.status_code == 200 and jina_resp.text.strip():
+                        material_parts.append(f"URL Content ({u}):\n{jina_resp.text[:per_url_chars]}")
+                        jina_fetches += 1
+                    else:
+                        material_parts.append(f"URL: {u}\n(Direct page content unavailable — brief based on domain context only.)")
+                except Exception as e:
+                    logger.warning(f"Jina fetch failed for {u}: {e}")
+                    material_parts.append(f"URL: {u}\n(Direct page content unavailable — brief based on domain context only.)")
     if file_content:
         material_parts.append(f"Uploaded document:\n{file_content[:8000]}")
     material = "\n\n".join(material_parts) if material_parts else "(No URL or file provided)"
@@ -5035,8 +5046,7 @@ async def prep_session(request: Request, data: dict):
     # Metered billing: charge the REAL cost (Jina page fetch + Groq-70B tokens),
     # not a flat tier price. Single source of truth = PROVIDER_RATES.
     prep_raw_cost = _llm_cost_usd("llama-3.3-70b-versatile", prep_pt, prep_ct)
-    if jina_content:
-        prep_raw_cost += PROVIDER_RATES["jina_fetch"]["req"]
+    prep_raw_cost += jina_fetches * PROVIDER_RATES["jina_fetch"]["req"]
     credits_cost = _cost_to_credits(prep_raw_cost)
     idem_key = hashlib.sha256(
         f"{user_id}:prep:{int(time.time() // 10)}".encode()
