@@ -740,9 +740,12 @@ Respond in the voice of a classic cartoon pirate — bold, theatrical, colorful 
 }
 
 STYLE_CONFIG = {
-    "Quick":     {"instruction": "LENGTH = QUICK: reply in one short sentence or two brief bullets — at most ~30 words, and shorter when a brief or yes/no answer is best. No minimum; never pad.", "max_tokens": 80},
-    "Standard":  {"instruction": "LENGTH = STANDARD: a balanced reply of about 31–60 words (2–4 sentences). Useful and complete, not a monologue.", "max_tokens": 220},
-    "Full":      {"instruction": "LENGTH = FULL: a thorough, fully-developed answer of about 61–220 words. Flesh out the reasoning and phrasing; do NOT be terse.", "max_tokens": 550},
+    "Quick":     {"instruction": "LENGTH = QUICK: reply in one short sentence or two brief bullets — at most ~30 words, and shorter when a brief or yes/no answer is best. No minimum; never pad.", "max_tokens": 80,
+                  "reminder": "LENGTH CHECK: This must be QUICK — 30 words MAX, one tight sentence. Do not exceed it."},
+    "Standard":  {"instruction": "LENGTH = STANDARD: a balanced reply of about 31–60 words (2–4 sentences). Useful and complete, not a monologue.", "max_tokens": 220,
+                  "reminder": "LENGTH CHECK: This must be STANDARD — 31 to 60 words, 2–4 full sentences."},
+    "Full":      {"instruction": "LENGTH = FULL: this is the LONG-FORM mode. Write a thorough, richly-developed answer of AT LEAST 5 full sentences and AT LEAST 90 words (up to ~220). Expand every point with specific reasoning, concrete examples, and complete phrasing the user can say word-for-word. Do NOT be terse, do NOT summarize, do NOT stop early — a short answer here is wrong.", "max_tokens": 550,
+                  "reminder": "LENGTH CHECK: This must be FULL — the LONG answer. AT LEAST 90 words and 5+ sentences. If your answer feels short, keep going and add specifics. A brief reply is a failure here."},
     "Nudge":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
     "Brief":     {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
     "shorthand": {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters.", "max_tokens": 80},
@@ -813,6 +816,12 @@ def build_system_prompt(
         "Return ONLY the answer the user should say. "
         "No preamble, no labels, no meta-commentary. Start directly with the answer."
     )
+
+    # Length reminder near the END for high recency — small models under-weight a length
+    # instruction buried mid-prompt, especially the long-form "Full" mode. Placed before
+    # user_preferences so a user's explicit length instruction can still override it.
+    if style_cfg.get("reminder"):
+        parts.append(style_cfg["reminder"])
 
     # User preferences placed LAST so the model sees them with highest recency weight.
     if user_preferences and user_preferences.strip():
