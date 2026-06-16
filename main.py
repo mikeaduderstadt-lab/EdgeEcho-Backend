@@ -100,7 +100,7 @@ app.add_middleware(
                    "https://hq.cerebroecho.com"],  # hq = standalone owner Command Center (separate app)
     # Allow Vercel PREVIEW deploys of the frontend (hashed URLs) so V2/feature branches are testable
     # without touching production. Scoped to this project's previews only.
-    allow_origin_regex=r"https://cerebroecho-frontend-[a-z0-9]+-cerebroechos-projects\.vercel\.app",
+    allow_origin_regex=r"https://cerebroecho-frontend-[a-z0-9-]+-cerebroechos-projects\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
