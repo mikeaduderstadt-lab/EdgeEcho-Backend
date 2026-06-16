@@ -1335,6 +1335,7 @@ async def transcribe(request: Request):
 async def coach(
     request: Request,
     transcript: str = Form(None),
+    whisper_seconds_in: float = Form(0.0),   # WS1: client STT duration so the reuse path still bills STT
     audio: UploadFile = File(None),
     file: UploadFile = File(None),
     deviceId: str = Form(...),
@@ -1412,7 +1413,15 @@ async def coach(
         # --- Transcript path: pre-transcribed text provided by frontend (e.g. Deepgram streaming) ---
         if transcript and transcript.strip():
             transcript = transcript.strip()
-            logger.info(f"📝 Using pre-transcribed text: {transcript[:80]}...")
+            whisper_seconds = max(0.0, min(float(whisper_seconds_in or 0.0), 7200.0))  # WS1: bill reused STT
+            logger.info(f"📝 Using pre-transcribed text ({whisper_seconds:.1f}s billed STT): {transcript[:80]}...")
+            if plan_type == "echo" and engine is not None and whisper_seconds > 0:
+                try:
+                    with engine.begin() as _conn:
+                        _conn.execute(text("UPDATE credits SET audio_seconds_used = audio_seconds_used + :secs WHERE user_id = :uid"),
+                                      {"secs": max(1, round(whisper_seconds)), "uid": user_key})
+                except Exception as _e:
+                    logger.error(f"audio_seconds increment error (transcript path): {_e}")
         else:
             # --- Audio path: run Groq Whisper STT ---
             actual_file = audio or file
@@ -1639,6 +1648,201 @@ async def coach(
         raise HTTPException(status_code=500, detail="Processing error. Please try again.")
 
 
+@app.post("/coach_stream")
+@limiter.limit(RATE_COACH)
+async def coach_stream(
+    request: Request,
+    transcript: str = Form(None),
+    whisper_seconds_in: float = Form(0.0),
+    deviceId: str = Form(...),
+    userEmail: str = Form("anonymous"),
+    context: str = Form("a professional role"),
+    work_history: str = Form(""),
+    style: str = Form("Standard"),
+    role: str = Form("Interview Coach"),
+    mode: str = Form("Diplomat"),
+    session_history: str = Form(""),
+    prior_summaries: str = Form(""),
+    session_context: str = Form(""),
+    user_preferences: str = Form(""),
+    ghost_mode: str = Form("false"),
+    custom_role_description: str = Form(""),
+    custom_mode_description: str = Form(""),
+):
+    """SSE streaming variant of /coach. Streams llama-3.1-8b-instant tokens, then a
+    final 'done' event with metered billing. /coach stays as the non-streaming fallback."""
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI service unavailable")
+    if not transcript or not transcript.strip():
+        raise HTTPException(status_code=400, detail="coach_stream requires 'transcript'")
+    transcript = transcript.strip()
+
+    raw_user_id, account_id, _ = _resolve_user(request, deviceId, userEmail)
+    user_key = _get_credits_user_id(raw_user_id, account_id)
+    credits = _get_credit_balance(user_key)
+    plan_type = credits["plan_type"]
+    tts_allowed = plan_type in TTS_ALLOWED_PLANS
+
+    if role in OPERATOR_ONLY_OPTIONS and plan_type not in CUSTOM_ALLOWED_PLANS:
+        role = "Interview Coach"
+    if mode in OPERATOR_ONLY_OPTIONS and plan_type not in CUSTOM_ALLOWED_PLANS:
+        mode = "Diplomat"
+    if plan_type == "free" and style == "Full":
+        style = "Standard"
+    if credits["balance"] < 1 and not credits.get("payg_enabled", False):
+        raise HTTPException(status_code=402, detail={
+            "code": "INSUFFICIENT_CREDITS",
+            "message": "Insufficient credits. Upgrade your plan or purchase an overage pack.",
+            "balance": credits["balance"], "cost": 1,
+        })
+
+    # WS1/WS2 billing parity: bill the reused STT seconds + echo audio cap.
+    whisper_seconds = max(0.0, min(float(whisper_seconds_in or 0.0), 7200.0))
+    if plan_type == "echo" and engine is not None and whisper_seconds > 0:
+        try:
+            with engine.begin() as _conn:
+                _conn.execute(text("UPDATE credits SET audio_seconds_used = audio_seconds_used + :s WHERE user_id = :u"),
+                              {"s": max(1, round(whisper_seconds)), "u": user_key})
+        except Exception as _e:
+            logger.error(f"audio_seconds increment (stream): {_e}")
+
+    # question-buffer merge (mirrors /coach)
+    merged = False
+    buf_entry = question_buffer.get(user_key)
+    if buf_entry and (time.time() - buf_entry["timestamp"]) <= CONTINUATION_TIMEOUT_S:
+        if _looks_like_continuation(buf_entry["transcript"], transcript):
+            transcript = buf_entry["transcript"].rstrip() + " " + transcript
+            merged = True
+    if ghost_mode.lower() != "true":
+        question_buffer[user_key] = {"transcript": transcript, "timestamp": time.time()}
+
+    try:    prior = json.loads(prior_summaries) if prior_summaries else []
+    except Exception: prior = []
+    try:    history = json.loads(session_history) if session_history else []
+    except Exception: history = []
+    prior_context = ("PREVIOUS SESSIONS:\n" + "\n---\n".join(prior)) if prior else ""
+    effective_session_context = session_context
+    if not effective_session_context.strip() and ghost_mode.lower() != "true":
+        effective_session_context = _get_ctx_cache(user_key)
+
+    system_prompt, max_tokens = build_system_prompt(
+        role=role, mode=mode, style=style, context=context, work_history=work_history,
+        prior_context=prior_context, session_context=effective_session_context,
+        user_preferences=user_preferences,
+        custom_role_description=custom_role_description, custom_mode_description=custom_mode_description,
+    )
+    FULL_TURNS = 10
+    recent = history[-FULL_TURNS:]
+    older  = history[:-FULL_TURNS] if len(history) > FULL_TURNS else []
+    def _clip(t, n):
+        t = (t or "").strip(); return t[:n] + ("…" if len(t) > n else "")
+    if older:
+        notes = "\n".join(f"• {_clip(t.get('question',''),50)} → {_clip(t.get('answer',''),80)}" for t in older)
+        system_prompt += f"\n\n[Earlier this session ({len(older)} exchanges):\n{notes}\n]"
+    messages = [{"role": "system", "content": system_prompt}]
+    for turn in recent:
+        messages.append({"role": "user", "content": f"Interview question: {turn['question']}"})
+        messages.append({"role": "assistant", "content": turn['answer']})
+    messages.append({"role": "user", "content": f"Interview question: {transcript}"})
+
+    start_time = time.time()
+    transcript_words = len(transcript.split())
+
+    async def event_gen():
+        def sse(event, data): return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+        yield sse("meta", {"transcript": transcript, "tts_allowed": tts_allowed,
+                           "merged": merged, "credits_remaining": credits["balance"]})
+        full_parts, finish_reason, usage = [], None, None
+        try:
+            q: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            def _produce():
+                try:
+                    stream = client.chat.completions.create(
+                        model="llama-3.1-8b-instant", messages=messages,
+                        temperature=0.6, max_tokens=max_tokens, top_p=0.9,
+                        stream=True, stream_options={"include_usage": True})
+                    for chunk in stream:
+                        loop.call_soon_threadsafe(q.put_nowait, ("chunk", chunk))
+                    loop.call_soon_threadsafe(q.put_nowait, ("end", None))
+                except Exception as e:
+                    loop.call_soon_threadsafe(q.put_nowait, ("error", e))
+            import threading
+            threading.Thread(target=_produce, daemon=True).start()
+            while True:
+                kind, payload = await q.get()
+                if kind == "error": raise payload
+                if kind == "end": break
+                chunk = payload
+                if getattr(chunk, "usage", None): usage = chunk.usage
+                if not chunk.choices: continue
+                if chunk.choices[0].finish_reason: finish_reason = chunk.choices[0].finish_reason
+                tok = getattr(chunk.choices[0].delta, "content", None)
+                if tok:
+                    full_parts.append(tok)
+                    yield sse("token", {"t": tok})
+            answer = "".join(full_parts).strip()
+
+            pt = getattr(usage, "prompt_tokens", None) if usage else None
+            ct = getattr(usage, "completion_tokens", None) if usage else None
+            raw_cost = (_llm_cost_usd("llama-3.1-8b-instant", pt, ct)
+                        + whisper_seconds * PROVIDER_RATES["whisper"]["sec"])
+            metered_credits = _cost_to_credits(raw_cost)
+            idem_key = hashlib.sha256(
+                f"{user_key}:{hashlib.sha256(transcript.encode()).hexdigest()}:{int(time.time()//10)}".encode()
+            ).hexdigest()
+            credits_remaining = _deduct_credits(
+                user_key, metered_credits, feature=f"coach:{style}", idempotency_key=idem_key,
+                provider="groq+whisper", input_units=pt, output_units=ct, raw_cost_usd=raw_cost)
+            if credits_remaining < 0:
+                credits_remaining = max(0, credits["balance"] - metered_credits)
+            _track_usage(user_key, userEmail, "groq_llm", len(answer), raw_cost)
+
+            confidence = ("low" if (finish_reason == "length" or transcript_words < 4)
+                          else "medium" if (transcript_words < 8 or merged) else "high")
+            yield sse("done", {"answer": answer, "transcript": transcript,
+                               "credits_remaining": credits_remaining, "merged": merged,
+                               "tts_allowed": tts_allowed, "confidence": confidence,
+                               "processing_time": round(time.time() - start_time, 3)})
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            logger.error(f"❌ /coach_stream ERROR: {e}")
+            yield sse("error", {"message": "stream_failed"})
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── WS4: persistent keep-alive httpx client for Cartesia ──
+# A fresh AsyncClient per /tts paid a full TCP+TLS handshake to Cartesia every whisper.
+# One pooled module-level client removes ~100–200ms/whisper steady-state.
+import httpx as _httpx
+_CARTESIA_LIMITS = _httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=300.0)
+_CARTESIA_TIMEOUT = _httpx.Timeout(connect=4.0, read=30.0, write=10.0, pool=5.0)
+_cartesia_client = None
+
+def _get_cartesia_client():
+    global _cartesia_client
+    if _cartesia_client is None or _cartesia_client.is_closed:
+        _cartesia_client = _httpx.AsyncClient(limits=_CARTESIA_LIMITS, timeout=_CARTESIA_TIMEOUT, http2=False)
+    return _cartesia_client
+
+@app.on_event("shutdown")
+async def _close_cartesia_client():
+    global _cartesia_client
+    if _cartesia_client is not None and not _cartesia_client.is_closed:
+        await _cartesia_client.aclose()
+
+async def _prewarm_cartesia():
+    """Warm the pooled connection at session start so the first whisper skips the handshake."""
+    if not os.environ.get("CARTESIA_API_KEY"):
+        return
+    try:
+        await _get_cartesia_client().get("https://api.cartesia.ai/", timeout=4.0)
+    except Exception as e:
+        logger.info(f"Cartesia prewarm skipped: {e}")
+
+
 @app.post("/tts")
 @limiter.limit(RATE_TTS)
 async def text_to_speech(request: Request, data: dict):
@@ -1694,13 +1898,12 @@ async def text_to_speech(request: Request, data: dict):
         # validating its status HERE, a real failure surfaces to the client as a real
         # error status — and the frontend's `if (!response.ok) throw` falls back to the
         # text answer instead of silently playing nothing.
-        http = httpx.AsyncClient(timeout=30.0)
+        http = _get_cartesia_client()  # WS4: shared keep-alive client (do NOT close per-request)
         try:
             req  = http.build_request("POST", "https://api.cartesia.ai/tts/bytes",
                                       headers=cartesia_headers, json=payload)
             resp = await http.send(req, stream=True)
         except Exception as e:
-            await http.aclose()
             sentry_sdk.capture_exception(e)
             logger.error(f"Cartesia connection error: {e}")
             _record_tts_failure(0, str(e)[:160])
@@ -1716,7 +1919,6 @@ async def text_to_speech(request: Request, data: dict):
             except Exception:
                 pass
             await resp.aclose()
-            await http.aclose()
             logger.error(f"Cartesia TTS upstream {resp.status_code}: {err_body}")
             sentry_sdk.capture_message(f"Cartesia TTS upstream {resp.status_code}: {err_body}")
             _record_tts_failure(resp.status_code, err_body)
@@ -1749,8 +1951,7 @@ async def text_to_speech(request: Request, data: dict):
                 sentry_sdk.capture_exception(e)
                 logger.error(f"Cartesia stream error mid-flight: {e}")
             finally:
-                await resp.aclose()
-                await http.aclose()
+                await resp.aclose()  # WS4: close the per-request response only; shared client stays open
             if streamed_any:
                 try:
                     _deduct_credits(_tts_user_key, tts_credits, feature="tts",
@@ -1774,6 +1975,9 @@ async def session_start(request: Request, data: dict):
     user_email = data.get("userEmail", "anonymous")
 
     user_id, account_id, _ = _resolve_user(request, device_id, user_email)
+
+    # WS4: warm the pooled Cartesia connection so the first whisper of the session skips the handshake.
+    asyncio.create_task(_prewarm_cartesia())
 
     summaries: list = []
     if engine is not None:
