@@ -740,12 +740,12 @@ Respond in the voice of a classic cartoon pirate — bold, theatrical, colorful 
 }
 
 STYLE_CONFIG = {
-    "Quick":     {"instruction": "LENGTH = QUICK: reply in one short sentence or two brief bullets — at most ~30 words, and shorter when a brief or yes/no answer is best. No minimum; never pad.", "max_tokens": 80,
-                  "reminder": "LENGTH CHECK: This must be QUICK — 30 words MAX, one tight sentence. Do not exceed it."},
-    "Standard":  {"instruction": "LENGTH = STANDARD: a balanced reply of about 31–60 words (2–4 sentences). Useful and complete, not a monologue.", "max_tokens": 220,
-                  "reminder": "LENGTH CHECK: This must be STANDARD — 31 to 60 words, 2–4 full sentences."},
-    "Full":      {"instruction": "LENGTH = FULL (long-form mode): build the answer in THREE distinct moves, each 1–2 full sentences: (1) directly answer what was just said; (2) back it with a specific example, detail, or reason; (3) close with how it applies, what it means going forward, or the impact. Each move must be substantive — no single-sentence replies. This is the rich, developed answer, not a summary.", "max_tokens": 550,
-                  "reminder": "LENGTH CHECK: This is FULL — include all THREE moves (answer → specific support → application/impact). If you only wrote one or two sentences, you are not done: add the missing moves with concrete detail."},
+    "Quick":     {"instruction": "LENGTH = QUICK: reply in EXACTLY ONE short sentence — at most ~25 words, and shorter when a brief or yes/no answer is best. Never a second sentence. Never pad.", "max_tokens": 70,
+                  "reminder": "LENGTH CHECK: QUICK = ONE sentence, 25 words max. If you wrote two sentences, cut it to one."},
+    "Standard":  {"instruction": "LENGTH = STANDARD: a balanced reply of EXACTLY 2 to 3 full sentences (about 35–55 words). Complete and useful, but never more than 3 sentences.", "max_tokens": 160,
+                  "reminder": "LENGTH CHECK: STANDARD = 2 to 3 sentences. Not one, not four or more."},
+    "Full":      {"instruction": "LENGTH = FULL (long-form mode): write 6 to 8 full sentences built in THREE moves, TWO sentences each: (1) directly answer what was just said; (2) back it with a specific example, detail, or reason; (3) close with how it applies or its impact going forward. Every move is two substantive sentences. This is the rich, developed answer — never a short reply.", "max_tokens": 550,
+                  "reminder": "LENGTH CHECK: FULL = 6 to 8 sentences (two per move: answer, support, application). If you wrote fewer than 6 sentences you are NOT done — keep going and add concrete detail."},
     "Nudge":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
     "Brief":     {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
     "shorthand": {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters.", "max_tokens": 80},
