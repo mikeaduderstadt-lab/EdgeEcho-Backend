@@ -1764,7 +1764,7 @@ async def coach_stream(
                     stream = client.chat.completions.create(
                         model="llama-3.1-8b-instant", messages=messages,
                         temperature=0.6, max_tokens=max_tokens, top_p=0.9,
-                        stream=True, stream_options={"include_usage": True})
+                        stream=True)
                     for chunk in stream:
                         loop.call_soon_threadsafe(q.put_nowait, ("chunk", chunk))
                     loop.call_soon_threadsafe(q.put_nowait, ("end", None))
@@ -1788,6 +1788,8 @@ async def coach_stream(
 
             pt = getattr(usage, "prompt_tokens", None) if usage else None
             ct = getattr(usage, "completion_tokens", None) if usage else None
+            if pt is None: pt = max(1, sum(len(m.get("content", "")) for m in messages) // 4)  # estimate (no usage chunk)
+            if ct is None: ct = max(1, len(answer) // 4)
             raw_cost = (_llm_cost_usd("llama-3.1-8b-instant", pt, ct)
                         + whisper_seconds * PROVIDER_RATES["whisper"]["sec"])
             metered_credits = _cost_to_credits(raw_cost)
