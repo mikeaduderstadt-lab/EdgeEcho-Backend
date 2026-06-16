@@ -740,12 +740,11 @@ Respond in the voice of a classic cartoon pirate — bold, theatrical, colorful 
 }
 
 STYLE_CONFIG = {
-    "Quick":     {"instruction": "LENGTH = QUICK: reply in EXACTLY ONE short sentence — at most ~25 words, and shorter when a brief or yes/no answer is best. Never a second sentence. Never pad.", "max_tokens": 70,
-                  "reminder": "LENGTH CHECK: QUICK = ONE sentence, 25 words max. If you wrote two sentences, cut it to one."},
-    "Standard":  {"instruction": "LENGTH = STANDARD: a balanced reply of EXACTLY 2 to 3 full sentences (about 35–55 words). Complete and useful, but never more than 3 sentences.", "max_tokens": 160,
-                  "reminder": "LENGTH CHECK: STANDARD = 2 to 3 sentences. Not one, not four or more."},
-    "Full":      {"instruction": "LENGTH = FULL (long-form mode): write 6 to 8 full sentences built in THREE moves, TWO sentences each: (1) directly answer what was just said; (2) back it with a specific example, detail, or reason; (3) close with how it applies or its impact going forward. Every move is two substantive sentences. This is the rich, developed answer — never a short reply.", "max_tokens": 550,
-                  "reminder": "LENGTH CHECK: FULL = 6 to 8 sentences (two per move: answer, support, application). If you wrote fewer than 6 sentences you are NOT done — keep going and add concrete detail."},
+    # No MINIMUMS on any length (owner 2026-06-16): a great short answer beats padded junk. These are
+    # soft CAPS + a quality-first directive, never a floor. Kept lean to minimise prompt size (latency).
+    "Quick":     {"instruction": "LENGTH = QUICK: answer in as few words as possible while still being genuinely useful — a short phrase or one sentence. Hard cap ~25 words. Never pad to fill space.", "max_tokens": 70},
+    "Standard":  {"instruction": "LENGTH = STANDARD: a focused reply, at most ~3 sentences (~55 words). Be as brief as the answer allows — if one sentence nails it, stop there. Never pad.", "max_tokens": 160},
+    "Full":      {"instruction": "LENGTH = FULL: you MAY develop a thorough answer (up to ~220 words) with specifics and reasoning WHEN depth genuinely helps the user. But if a shorter answer is better, give the shorter one — never add filler to hit a length.", "max_tokens": 550},
     "Nudge":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
     "Brief":     {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
     "shorthand": {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters.", "max_tokens": 80},
