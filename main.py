@@ -1809,8 +1809,8 @@ async def coach_stream(
                                "processing_time": round(time.time() - start_time, 3)})
         except Exception as e:
             sentry_sdk.capture_exception(e)
-            logger.error(f"❌ /coach_stream ERROR: {e}")
-            yield sse("error", {"message": "stream_failed"})
+            logger.error(f"❌ /coach_stream ERROR: {type(e).__name__}: {e}")
+            yield sse("error", {"message": "stream_failed", "detail": f"{type(e).__name__}: {str(e)[:200]}"})
 
     return StreamingResponse(event_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
