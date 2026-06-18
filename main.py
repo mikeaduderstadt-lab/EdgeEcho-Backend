@@ -3585,21 +3585,21 @@ async def stripe_webhook(request: Request):
     except stripe.errors.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    # Parse raw payload as plain dict so all .get() calls work regardless of
-    # stripe-sdk version (v10+ returns typed objects, not dicts).
-    raw        = json.loads(payload)
-    event_id   = raw["id"]
-    event_type = raw["type"]
-    obj        = raw["data"]["object"]
-
-    # ── Idempotency: Stripe retries on non-2xx; skip already-processed events ──
-    if _is_duplicate_event(event_id):
-        logger.info(f"🔁 Duplicate webhook {event_id} ({event_type}) — already processed, skipping")
-        return {"received": True}
-
-    logger.info(f"📨 Stripe webhook: {event_type} | id={event_id}")
-
     try:
+        # Parse raw payload as plain dict so all .get() calls work regardless of
+        # stripe-sdk version (v10+ returns typed objects, not dicts).
+        raw        = json.loads(payload)
+        event_id   = raw["id"]
+        event_type = raw["type"]
+        obj        = raw["data"]["object"]
+
+        # ── Idempotency: Stripe retries on non-2xx; skip already-processed events ──
+        if _is_duplicate_event(event_id):
+            logger.info(f"🔁 Duplicate webhook {event_id} ({event_type}) — already processed, skipping")
+            return {"received": True}
+
+        logger.info(f"📨 Stripe webhook: {event_type} | id={event_id}")
+
         # ── checkout.session.completed ────────────────────────────────────────
         if event_type == "checkout.session.completed":
             meta        = obj.get("metadata", {})
