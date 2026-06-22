@@ -1072,6 +1072,23 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS credits_account_id_idx ON credits(account_id)",
         "CREATE INDEX IF NOT EXISTS session_history_account_id_idx ON session_history(account_id)",
         "CREATE INDEX IF NOT EXISTS preferences_account_id_idx ON preferences(account_id)",
+        # ── Self-hosted website visitor tracking (feeds HQ dashboard) ──────────
+        """
+        CREATE TABLE IF NOT EXISTS page_views (
+            id          BIGSERIAL PRIMARY KEY,
+            ts          TIMESTAMPTZ DEFAULT NOW(),
+            path        TEXT,
+            referrer    TEXT,
+            visitor_id  TEXT,
+            session_id  TEXT,
+            country     TEXT,
+            device      TEXT,
+            browser     TEXT,
+            is_bot      BOOLEAN DEFAULT FALSE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_page_views_ts ON page_views(ts DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_page_views_visitor ON page_views(visitor_id, ts DESC)",
     ]
     try:
         with engine.connect() as conn:
@@ -1314,6 +1331,69 @@ async def post_suggestion_feedback(request: Request):
                 conn.commit()
         except Exception as e:
             logger.error(f"suggestion_feedback insert error: {e}")
+    return {"ok": True}
+
+
+@app.post("/track")
+@limiter.limit("120/minute")
+async def track_page_view(request: Request):
+    """Self-hosted website visitor tracker. Public, no auth. Privacy-first:
+    never stores raw IP — visitor_id is a rotating daily SHA-256 pseudonym.
+    Always returns 200 (analytics must never break the user's page)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    path     = (body.get("path") or "")[:512]
+    referrer = (body.get("referrer") or None)
+    if referrer:
+        referrer = str(referrer)[:512]
+    session_id = (body.get("sid") or None)
+    if session_id:
+        session_id = str(session_id)[:128]
+
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
+        request.client.host if request.client else "")
+    user_agent = request.headers.get("user-agent", "") or ""
+    ua_lower = user_agent.lower()
+
+    daily_salt = datetime.utcnow().strftime("%Y%m%d") + os.environ.get("TRACK_SALT", "cerebro-default-salt")
+    visitor_id = hashlib.sha256((daily_salt + ip + user_agent).encode()).hexdigest()[:16]
+
+    country = request.headers.get("cf-ipcountry") or None
+
+    if "Mobi" in user_agent:
+        device = "mobile"
+    elif "Tablet" in user_agent or "iPad" in user_agent:
+        device = "tablet"
+    else:
+        device = "desktop"
+
+    if "Edg" in user_agent:
+        browser = "Edge"
+    elif "Chrome" in user_agent:
+        browser = "Chrome"
+    elif "Firefox" in user_agent:
+        browser = "Firefox"
+    elif "Safari" in user_agent:
+        browser = "Safari"
+    else:
+        browser = "Other"
+
+    _bot_markers = ("bot", "crawl", "spider", "slurp", "headless", "lighthouse", "python-requests", "curl", "wget")
+    is_bot = (not user_agent) or any(m in ua_lower for m in _bot_markers)
+
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    INSERT INTO page_views (path, referrer, visitor_id, session_id, country, device, browser, is_bot)
+                    VALUES (:path, :ref, :vid, :sid, :country, :device, :browser, :is_bot)
+                """), {"path": path, "ref": referrer, "vid": visitor_id, "sid": session_id,
+                       "country": country, "device": device, "browser": browser, "is_bot": is_bot})
+                conn.commit()
+        except Exception as e:
+            logger.error(f"page_views insert error: {e}")
     return {"ok": True}
 
 
@@ -4362,27 +4442,84 @@ def _admin_stripe_metrics() -> dict:
 
 
 async def _admin_visitor_metrics() -> dict:
-    """Plausible site visitors. Inert unless PLAUSIBLE_API_KEY is set."""
-    out = {"configured": False, "realtime": None, "visitors_30d": None, "pageviews_30d": None, "site": None}
-    key  = os.environ.get("PLAUSIBLE_API_KEY")
+    """Self-hosted site visitors from the page_views table. Bots are filtered
+    out everywhere (is_bot = false). Best-effort; never raises."""
     site = os.environ.get("PLAUSIBLE_SITE_ID", "cerebroecho.com")
-    if not key:
+    out = {
+        "configured": True,
+        "source": "self",
+        "realtime": 0,
+        "visitors_today": 0,
+        "visitors_30d": 0,
+        "pageviews_30d": 0,
+        "visitors_7d": 0,
+        "top_pages": [],
+        "top_referrers": [],
+        "series": [],
+        "site": site,
+    }
+    if engine is None:
         return out
-    out["configured"] = True
-    out["site"] = site
     try:
-        import httpx
-        headers = {"Authorization": f"Bearer {key}"}
-        base = "https://plausible.io/api/v1/stats"
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as h:
-            rt = await h.get(f"{base}/realtime/visitors", params={"site_id": site})
-            if rt.status_code == 200:
-                out["realtime"] = rt.json()
-            agg = await h.get(f"{base}/aggregate", params={"site_id": site, "period": "30d", "metrics": "visitors,pageviews"})
-            if agg.status_code == 200:
-                res = agg.json().get("results", {})
-                out["visitors_30d"]  = (res.get("visitors")  or {}).get("value")
-                out["pageviews_30d"] = (res.get("pageviews") or {}).get("value")
+        from urllib.parse import urlparse
+        with engine.connect() as conn:
+            out["realtime"] = int(conn.execute(text(
+                "SELECT COUNT(DISTINCT session_id) FROM page_views "
+                "WHERE ts >= NOW() - INTERVAL '5 minutes' AND is_bot = false"
+            )).scalar() or 0)
+            out["visitors_today"] = int(conn.execute(text(
+                "SELECT COUNT(DISTINCT visitor_id) FROM page_views "
+                "WHERE ts >= DATE_TRUNC('day', NOW()) AND is_bot = false"
+            )).scalar() or 0)
+            out["visitors_30d"] = int(conn.execute(text(
+                "SELECT COUNT(DISTINCT visitor_id) FROM page_views "
+                "WHERE ts >= NOW() - INTERVAL '30 days' AND is_bot = false"
+            )).scalar() or 0)
+            out["pageviews_30d"] = int(conn.execute(text(
+                "SELECT COUNT(*) FROM page_views "
+                "WHERE ts >= NOW() - INTERVAL '30 days' AND is_bot = false"
+            )).scalar() or 0)
+            out["visitors_7d"] = int(conn.execute(text(
+                "SELECT COUNT(DISTINCT visitor_id) FROM page_views "
+                "WHERE ts >= NOW() - INTERVAL '7 days' AND is_bot = false"
+            )).scalar() or 0)
+
+            page_rows = conn.execute(text("""
+                SELECT COALESCE(path, '') AS path, COUNT(*) AS views
+                FROM page_views
+                WHERE ts >= NOW() - INTERVAL '30 days' AND is_bot = false
+                GROUP BY path ORDER BY views DESC LIMIT 8
+            """)).fetchall()
+            out["top_pages"] = [{"path": r[0], "views": int(r[1])} for r in page_rows]
+
+            ref_rows = conn.execute(text("""
+                SELECT CASE WHEN referrer IS NULL OR referrer = '' THEN 'direct' ELSE referrer END AS ref,
+                       COUNT(*) AS views
+                FROM page_views
+                WHERE ts >= NOW() - INTERVAL '30 days' AND is_bot = false
+                GROUP BY ref ORDER BY views DESC LIMIT 8
+            """)).fetchall()
+            top_referrers = []
+            for r in ref_rows:
+                ref = r[0] or "direct"
+                if ref.startswith("http"):
+                    try:
+                        host = urlparse(ref).netloc
+                        if host:
+                            ref = host
+                    except Exception:
+                        pass
+                top_referrers.append({"ref": ref, "views": int(r[1])})
+            out["top_referrers"] = top_referrers
+
+            srows = conn.execute(text("""
+                SELECT TO_CHAR(DATE_TRUNC('day', ts), 'YYYY-MM-DD') AS day,
+                       COUNT(DISTINCT visitor_id) AS visitors
+                FROM page_views
+                WHERE ts >= NOW() - INTERVAL '30 days' AND is_bot = false
+                GROUP BY day ORDER BY day
+            """)).fetchall()
+            out["series"] = [{"day": r[0], "visitors": int(r[1])} for r in srows]
     except Exception as e:
         logger.error(f"admin visitor metrics error: {e}")
     return out
