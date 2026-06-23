@@ -2521,6 +2521,7 @@ async def end_session(request: Request, data: dict):
     duration_seconds = int(data.get("duration_seconds", 0))
     ghost_mode = bool(data.get("ghost_mode", False))
     save_memory = bool(data.get("save_memory", False))
+    from_precall = bool(data.get("from_precall", False))
 
     # Ghost mode: wipe in-memory traces and store nothing
     if ghost_mode:
@@ -2569,7 +2570,10 @@ async def end_session(request: Request, data: dict):
             _deduct_credits(credits_uid, 2, feature="memory_save")
         except Exception as e:
             logger.warning(f"end-session memory_save credit deduct failed: {e}")
-    elif client is not None and can_summarize:
+    elif client is not None and from_precall and can_summarize:
+        # Owner request: auto-generate a summary ONLY for pre-call sessions.
+        # Other sessions keep the full transcript (saved below) but no auto summary —
+        # the placeholder "Session with N exchanges." stays and title-gen is skipped.
         history_text = "\n".join(
             [f"Q: {t.get('question','')}\nA: {t.get('answer','')}" for t in transcript[-10:]]
         )
@@ -2636,6 +2640,57 @@ async def end_session(request: Request, data: dict):
     _clear_ctx_cache(f"{device_id}_{user_email}")
     logger.info(f"📝 end-session {session_id[:8]}… | {role}/{mode} | {duration_seconds}s | {summary[:50]}")
     return {"status": "saved", "summary": summary}
+
+
+@app.post("/summarize-session")
+async def summarize_session(request: Request, data: dict):
+    session_id = data.get("session_id", "")
+    device_id  = data.get("deviceId", "")
+    user_email = data.get("userEmail", "anonymous")
+    transcript = data.get("transcript", [])
+    if not transcript or len(transcript) < 2:
+        return {"status": "skipped", "summary": ""}
+    if client is None:
+        raise HTTPException(status_code=503, detail={"code": "LLM_UNAVAILABLE", "message": "Summarizer unavailable."})
+    user_id, account_id, _ = _resolve_user(request, device_id, user_email)
+    credits_uid = _get_credits_user_id(user_id, account_id)
+    # Build prompt from the full transcript
+    history_text = "\n".join([f"Q: {t.get('question','')}\nA: {t.get('answer','')}" for t in transcript])
+    prompt = ("Summarize this coaching session in 2-4 sentences (under 80 words). "
+              "Cover: what topic was discussed, key names or companies mentioned, "
+              "what was decided or coached, and how the conversation went. Be specific.\n\n" + history_text)
+    summary = ""
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3, max_tokens=160,
+        )
+        summary = completion.choices[0].message.content.strip().rstrip(".")
+    except Exception as e:
+        logger.error(f"summarize-session error: {e}")
+        raise HTTPException(status_code=502, detail={"code": "SUMMARY_FAILED", "message": "Could not generate summary."})
+    # Meter the LLM cost. Flat 2 credits matches the documented "summary 1-2 cr"
+    # and the /end-session memory_save deduction pattern. _deduct_credits returns
+    # the remaining balance (balance_after), so capture it for the response.
+    credits_remaining = None
+    try:
+        credits_remaining = _deduct_credits(credits_uid, 2, feature="summarize_on_demand")
+    except Exception as e:
+        logger.warning(f"summarize-session credit deduct failed: {e}")
+    # Persist to session_history so it shows in history/briefings (upsert on session_id).
+    # UPDATE only — if the row doesn't exist yet (live session), it's a no-op and the
+    # frontend still uses the returned summary; /end-session owns the INSERT.
+    if engine is not None and session_id:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    UPDATE session_history SET summary = :summary WHERE session_id = :sid
+                """), {"summary": summary, "sid": session_id})
+                conn.commit()
+        except Exception as e:
+            logger.error(f"summarize-session DB error: {e}")
+    return {"status": "ok", "summary": summary, "credits_remaining": credits_remaining}
 
 
 @app.get("/session-memory")
@@ -4396,14 +4451,17 @@ def _admin_stripe_metrics() -> dict:
     if not stripe_key:
         return out
     out["configured"] = True
+    stripe.api_key = stripe_key
+    since = int((datetime.utcnow() - timedelta(days=30)).timestamp())
+
+    # MRR from active subscriptions, normalized to a monthly figure
     try:
-        stripe.api_key = stripe_key
-        # MRR from active subscriptions, normalized to a monthly figure
         mrr = 0.0
         sub_count = 0
         for s in stripe.Subscription.list(status="active", limit=100).auto_paging_iter():
             sub_count += 1
-            for it in s["items"]["data"]:
+            items_data = (s.get("items") or {}).get("data") or []
+            for it in items_data:
                 price    = it.get("price") or {}
                 amt      = (price.get("unit_amount") or 0) / 100.0
                 qty      = it.get("quantity", 1) or 1
@@ -4412,23 +4470,62 @@ def _admin_stripe_metrics() -> dict:
                 mrr += amt * qty * factor
         out["mrr"] = round(mrr, 2)
         out["active_subscriptions"] = sub_count
+    except Exception as e:
+        logger.error(f"admin stripe MRR error: {e}")
 
-        since = int((datetime.utcnow() - timedelta(days=30)).timestamp())
-        # Gross succeeded charges (30d) + a few recent ones for the activity feed
+    # Gross revenue (30d) + recent feed.
+    # Subscription payments flow through Invoices (not Charges directly), so we query
+    # invoices first — they carry customer_email and are the authoritative record for
+    # recurring billing. One-time charges (e.g. founding_50) are picked up via
+    # stripe.Charge.list() filtered to entries with no invoice link.
+    try:
         gross = 0.0
         recent = []
+        seen_charge_ids: set = set()
+
+        # Paid invoices (covers all subscription payments including first month)
+        for inv in stripe.Invoice.list(created={"gte": since}, limit=100).auto_paging_iter():
+            if inv.get("status") == "paid" and (inv.get("amount_paid") or 0) > 0:
+                amt = (inv.get("amount_paid") or 0) / 100.0
+                # Track the underlying charge id so the Charge loop skips it
+                charge_id = inv.get("charge") or ""
+                if charge_id:
+                    seen_charge_ids.add(charge_id)
+                gross += amt
+                if len(recent) < 12:
+                    recent.append({
+                        "type": "charge",
+                        "amount": round(amt, 2),
+                        "email": inv.get("customer_email"),
+                        "created": inv.get("created"),
+                    })
+
+        # One-time charges not linked to an invoice (e.g. founding_50 one-time payment)
         for c in stripe.Charge.list(created={"gte": since}, limit=100).auto_paging_iter():
-            if c.get("paid") and c.get("status") == "succeeded":
+            if c.get("paid") and c.get("status") == "succeeded" and not c.get("invoice"):
+                cid = c.get("id") or ""
+                if cid in seen_charge_ids:
+                    continue
+                if cid:
+                    seen_charge_ids.add(cid)
                 amt = (c.get("amount") or 0) / 100.0
                 gross += amt
                 if len(recent) < 12:
-                    recent.append({"type": "charge", "amount": round(amt, 2),
-                                   "email": (c.get("billing_details") or {}).get("email"),
-                                   "created": c.get("created")})
-        out["gross_30d"] = round(gross, 2)
-        out["recent"] = recent
+                    recent.append({
+                        "type": "charge",
+                        "amount": round(amt, 2),
+                        "email": (c.get("billing_details") or {}).get("email"),
+                        "created": c.get("created"),
+                    })
 
-        # Refunds (30d)
+        recent.sort(key=lambda x: x.get("created") or 0, reverse=True)
+        out["gross_30d"] = round(gross, 2)
+        out["recent"] = recent[:12]
+    except Exception as e:
+        logger.error(f"admin stripe revenue error: {e}")
+
+    # Refunds (30d)
+    try:
         ref_total = 0.0
         ref_count = 0
         for r in stripe.Refund.list(created={"gte": since}, limit=100).auto_paging_iter():
@@ -4437,7 +4534,8 @@ def _admin_stripe_metrics() -> dict:
         out["refunds_30d"] = round(ref_total, 2)
         out["refund_count_30d"] = ref_count
     except Exception as e:
-        logger.error(f"admin stripe metrics error: {e}")
+        logger.error(f"admin stripe refunds error: {e}")
+
     return out
 
 
