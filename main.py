@@ -4444,7 +4444,12 @@ def _admin_db_metrics() -> dict:
 
 
 def _admin_stripe_metrics() -> dict:
-    """Earnings (MRR), recent gross, and refunds from Stripe. Best-effort; never raises."""
+    """Earnings (MRR), recent gross, and refunds from Stripe. Best-effort; never raises.
+
+    Uses getattr() throughout instead of .get() because stripe-python v8+ returns typed
+    objects (not dict subclasses) for nested fields, causing AttributeError('get') when
+    .get() is called via __getattr__. getattr(obj, key, default) works on any object.
+    """
     out = {"configured": False, "mrr": 0.0, "active_subscriptions": 0, "gross_30d": 0.0,
            "refunds_30d": 0.0, "refund_count_30d": 0, "currency": "usd", "recent": []}
     stripe_key = os.environ.get("STRIPE_SECRET_KEY")
@@ -4460,13 +4465,15 @@ def _admin_stripe_metrics() -> dict:
         sub_count = 0
         for s in stripe.Subscription.list(status="active", limit=100).auto_paging_iter():
             sub_count += 1
-            items_data = (s.get("items") or {}).get("data") or []
+            items     = getattr(s, "items", None)
+            items_data = getattr(items, "data", []) or []
             for it in items_data:
-                price    = it.get("price") or {}
-                amt      = (price.get("unit_amount") or 0) / 100.0
-                qty      = it.get("quantity", 1) or 1
-                interval = (price.get("recurring") or {}).get("interval", "month")
-                factor   = {"month": 1, "year": 1 / 12, "week": 52 / 12, "day": 365 / 12}.get(interval, 1)
+                price    = getattr(it, "price", None)
+                amt      = (getattr(price, "unit_amount", 0) or 0) / 100.0
+                qty      = getattr(it, "quantity", 1) or 1
+                recurring = getattr(price, "recurring", None)
+                interval  = getattr(recurring, "interval", "month") if recurring else "month"
+                factor    = {"month": 1, "year": 1 / 12, "week": 52 / 12, "day": 365 / 12}.get(interval, 1)
                 mrr += amt * qty * factor
         out["mrr"] = round(mrr, 2)
         out["active_subscriptions"] = sub_count
@@ -4480,47 +4487,53 @@ def _admin_stripe_metrics() -> dict:
     # stripe.Charge.list() filtered to entries with no invoice link.
     try:
         gross = 0.0
-        recent = []
-        seen_charge_ids: set = set()
+        recent: list = []
+        seen_ids: set = set()
 
-        # Paid invoices (covers all subscription payments including first month)
+        # Paid invoices — covers all subscription payments including the first month
         for inv in stripe.Invoice.list(created={"gte": since}, limit=100).auto_paging_iter():
-            if inv.get("status") == "paid" and (inv.get("amount_paid") or 0) > 0:
-                amt = (inv.get("amount_paid") or 0) / 100.0
-                # Track the underlying charge id so the Charge loop skips it
-                charge_id = inv.get("charge") or ""
+            status      = getattr(inv, "status", None)
+            amount_paid = getattr(inv, "amount_paid", 0) or 0
+            if status == "paid" and amount_paid > 0:
+                amt       = amount_paid / 100.0
+                charge_id = getattr(inv, "charge", "") or ""
                 if charge_id:
-                    seen_charge_ids.add(charge_id)
+                    seen_ids.add(charge_id)
                 gross += amt
                 if len(recent) < 12:
                     recent.append({
-                        "type": "charge",
-                        "amount": round(amt, 2),
-                        "email": inv.get("customer_email"),
-                        "created": inv.get("created"),
+                        "type":    "charge",
+                        "amount":  round(amt, 2),
+                        "email":   getattr(inv, "customer_email", None),
+                        "created": getattr(inv, "created", None),
                     })
 
-        # One-time charges not linked to an invoice (e.g. founding_50 one-time payment)
+        # One-time charges not linked to an invoice (e.g. founding_50)
         for c in stripe.Charge.list(created={"gte": since}, limit=100).auto_paging_iter():
-            if c.get("paid") and c.get("status") == "succeeded" and not c.get("invoice"):
-                cid = c.get("id") or ""
-                if cid in seen_charge_ids:
+            paid    = getattr(c, "paid", False)
+            status  = getattr(c, "status", None)
+            invoice = getattr(c, "invoice", None)
+            if paid and status == "succeeded" and not invoice:
+                cid = getattr(c, "id", "") or ""
+                if cid in seen_ids:
                     continue
                 if cid:
-                    seen_charge_ids.add(cid)
-                amt = (c.get("amount") or 0) / 100.0
+                    seen_ids.add(cid)
+                amt             = (getattr(c, "amount", 0) or 0) / 100.0
+                billing_details = getattr(c, "billing_details", None)
+                email           = getattr(billing_details, "email", None) if billing_details else None
                 gross += amt
                 if len(recent) < 12:
                     recent.append({
-                        "type": "charge",
-                        "amount": round(amt, 2),
-                        "email": (c.get("billing_details") or {}).get("email"),
-                        "created": c.get("created"),
+                        "type":    "charge",
+                        "amount":  round(amt, 2),
+                        "email":   email,
+                        "created": getattr(c, "created", None),
                     })
 
         recent.sort(key=lambda x: x.get("created") or 0, reverse=True)
         out["gross_30d"] = round(gross, 2)
-        out["recent"] = recent[:12]
+        out["recent"]    = recent[:12]
     except Exception as e:
         logger.error(f"admin stripe revenue error: {e}")
 
@@ -4529,9 +4542,9 @@ def _admin_stripe_metrics() -> dict:
         ref_total = 0.0
         ref_count = 0
         for r in stripe.Refund.list(created={"gte": since}, limit=100).auto_paging_iter():
-            ref_total += (r.get("amount") or 0) / 100.0
+            ref_total += (getattr(r, "amount", 0) or 0) / 100.0
             ref_count += 1
-        out["refunds_30d"] = round(ref_total, 2)
+        out["refunds_30d"]      = round(ref_total, 2)
         out["refund_count_30d"] = ref_count
     except Exception as e:
         logger.error(f"admin stripe refunds error: {e}")
