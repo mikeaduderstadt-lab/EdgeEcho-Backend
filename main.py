@@ -424,7 +424,9 @@ def _get_credits_user_id(fallback_user_id: str, account_id: str | None) -> str:
 
 
 def reset_expired_credits():
-    """Reset balances for any user whose reset_date has passed (runs at startup)."""
+    """Reset balances for any user whose reset_date has passed (runs at startup).
+    founding_50 is a one-time LTD plan — it must never have reset_date set, so it
+    is excluded here as a safety guard even if reset_date was accidentally populated."""
     if engine is None:
         return
     now = datetime.utcnow().isoformat()
@@ -433,6 +435,7 @@ def reset_expired_credits():
             rows = conn.execute(text("""
                 SELECT user_id, plan_type FROM credits
                 WHERE reset_date IS NOT NULL AND reset_date <= :now
+                  AND plan_type <> 'founding_50'
             """), {"now": now}).fetchall()
             for uid, plan in rows:
                 new_bal = PLAN_CREDITS.get(plan, PLAN_CREDITS["free"])
@@ -443,9 +446,16 @@ def reset_expired_credits():
                         audio_seconds_used = 0
                     WHERE user_id = :uid
                 """), {"bal": new_bal, "reset": new_reset, "uid": uid})
+            # Safety: null out any founding_50 reset_dates that slipped in
+            conn.execute(text("""
+                UPDATE credits SET reset_date = NULL
+                WHERE plan_type = 'founding_50' AND reset_date IS NOT NULL
+            """))
             if rows:
                 conn.commit()
                 logger.info(f"🔄 Monthly credits reset for {len(rows)} users")
+            else:
+                conn.commit()
     except Exception as e:
         logger.error(f"reset_expired_credits error: {e}")
         sentry_sdk.capture_exception(e)
@@ -3262,6 +3272,14 @@ async def billing_portal(request: Request, data: dict):
     stripe.api_key = stripe_key
     user_id, account_id, _ = _resolve_user(request, device_id, user_email)
 
+    # founding_50 is a one-time LTD purchase — no recurring subscription to manage
+    creds = _get_credit_balance(user_id)
+    if creds.get("plan_type") == "founding_50":
+        raise HTTPException(status_code=400, detail={
+            "code": "LTD_NO_PORTAL",
+            "message": "Founding member plans are lifetime and have no subscription to manage. Contact support@cerebroecho.com for assistance.",
+        })
+
     # Look up the Stripe customer ID — prefer account_id match for cross-device access
     try:
         with engine.connect() as conn:
@@ -3686,6 +3704,26 @@ async def create_checkout(request: Request, data: dict):
     # Use the canonical credits row key so the webhook hits the right row
     user_id = _get_credits_user_id(raw_user_id, account_id)
 
+    # Reuse existing Stripe customer if one exists — prevents fragmented billing history
+    existing_customer_id = None
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                if account_id:
+                    row = conn.execute(
+                        text("SELECT customer_id FROM stripe_customers WHERE account_id = :aid OR user_id = :uid LIMIT 1"),
+                        {"aid": account_id, "uid": user_id}
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        text("SELECT customer_id FROM stripe_customers WHERE user_id = :uid LIMIT 1"),
+                        {"uid": user_id}
+                    ).fetchone()
+                if row:
+                    existing_customer_id = row[0]
+        except Exception as e:
+            logger.warning(f"checkout: customer lookup error (non-fatal): {e}")
+
     try:
         metadata = {"plan": plan, "user_id": user_id}
         if account_id:
@@ -3697,7 +3735,9 @@ async def create_checkout(request: Request, data: dict):
             "success_url":  "https://cerebroecho.com/app?payment=success",
             "cancel_url":   "https://cerebroecho.com/app?payment=cancelled",
         }
-        if user_email and user_email != "anonymous" and "@" in user_email:
+        if existing_customer_id:
+            session_kwargs["customer"] = existing_customer_id
+        elif user_email and user_email != "anonymous" and "@" in user_email:
             session_kwargs["customer_email"] = user_email
         session = stripe.checkout.Session.create(**session_kwargs)
         return {"url": session.url}
@@ -3760,7 +3800,11 @@ async def stripe_webhook(request: Request):
                 logger.error("❌ checkout.session.completed: no DB engine")
             else:
                 new_balance = PLAN_CREDITS[plan]
-                reset_date  = (datetime.utcnow() + timedelta(days=30)).isoformat() if plan != "free" else None
+                # founding_50 is a one-time LTD — no monthly reset; free has no reset either
+                reset_date = (
+                    (datetime.utcnow() + timedelta(days=30)).isoformat()
+                    if plan not in ("free", "founding_50") else None
+                )
                 try:
                     with engine.connect() as conn:
                         conn.execute(text("""
@@ -3802,8 +3846,12 @@ async def stripe_webhook(request: Request):
                     logger.error(f"❌ checkout.session.completed DB error: {e}")
 
         # ── invoice.paid (monthly renewal) ────────────────────────────────────
-        # Stripe fires this for every successful invoice, including the initial one.
-        # We only reset credits on subscription_cycle to avoid racing checkout.session.completed.
+        # Fires for every successful invoice. We reset credits on subscription_cycle
+        # and subscription_update. We skip subscription_create to avoid racing
+        # checkout.session.completed.
+        # Plan is derived from the invoice's line-item price ID so this handler is
+        # order-independent — works even if it arrives before subscription.updated
+        # on payment recovery after a grace-period downgrade.
         elif event_type == "invoice.paid":
             customer_id    = obj.get("customer", "")
             billing_reason = obj.get("billing_reason", "")
@@ -3817,8 +3865,14 @@ async def stripe_webhook(request: Request):
                     logger.warning(f"⚠️ invoice.paid: no user mapping for customer {customer_id}")
                 elif engine is not None:
                     creds = _get_credit_balance(uid)
-                    plan  = creds["plan_type"]
-                    if plan in PLAN_CREDITS and plan != "free":
+                    # Prefer the plan from the invoice's line-item price_id so this is
+                    # order-independent (payment recovery fires invoice.paid before
+                    # subscription.updated, so DB plan_type may still be 'free').
+                    line_items   = obj.get("lines", {}).get("data", [])
+                    stripe_price = (line_items[0].get("price", {}).get("id") if line_items else None)
+                    price_to_plan = {v: k for k, v in STRIPE_PRICE_IDS.items() if v}
+                    plan = (price_to_plan.get(stripe_price) if stripe_price else None) or creds["plan_type"]
+                    if plan in PLAN_CREDITS and plan not in ("free", "founding_50"):
                         new_balance = PLAN_CREDITS[plan]
                         new_reset   = (datetime.utcnow() + timedelta(days=30)).isoformat()
                         try:
@@ -4024,6 +4078,50 @@ async def stripe_webhook(request: Request):
                     _track_usage(uid, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "cancellation"}))
                 except Exception as e:
                     logger.error(f"❌ subscription.deleted DB error: {e}")
+
+        # ── charge.refunded ────────────────────────────────────────────────────
+        # Handles refunds on one-time payments (founding_50 mode=payment).
+        # Subscription refunds don't revoke access here — those go through
+        # customer.subscription.deleted or manual downgrade by support.
+        elif event_type == "charge.refunded":
+            charge_id   = obj.get("id", "")
+            refunded    = obj.get("refunded", False)       # True when fully refunded
+            payment_intent = obj.get("payment_intent", "")
+
+            if refunded and engine is not None:
+                try:
+                    with engine.connect() as conn:
+                        # Look for a founding_50 row whose stripe_payment_id matches
+                        row = conn.execute(text("""
+                            SELECT user_id, account_id FROM founding_members
+                            WHERE stripe_payment_id = :pid OR stripe_payment_id = :cid
+                            LIMIT 1
+                        """), {"pid": payment_intent, "cid": charge_id}).fetchone()
+                        if row:
+                            uid, aid = row[0], row[1]
+                            conn.execute(text("""
+                                UPDATE credits SET
+                                    plan_type   = 'free',
+                                    balance     = 0,
+                                    reset_date  = NULL,
+                                    subscription_status = 'canceled'
+                                WHERE user_id = :uid
+                            """), {"uid": uid})
+                            conn.execute(text("""
+                                DELETE FROM founding_members WHERE user_id = :uid
+                            """), {"uid": uid})
+                            conn.commit()
+                            logger.info(
+                                f"🚫 charge.refunded: founding_50 revoked for user={uid} "
+                                f"charge={charge_id} pi={payment_intent}"
+                            )
+                        else:
+                            logger.info(
+                                f"📨 charge.refunded: no founding_50 match for "
+                                f"charge={charge_id} pi={payment_intent} — no action"
+                            )
+                except Exception as e:
+                    logger.error(f"❌ charge.refunded DB error: {e}")
 
         else:
             logger.info(f"📨 Unhandled Stripe event type: {event_type!r}")
@@ -4408,7 +4506,9 @@ def _admin_db_metrics() -> dict:
             # ── Members / plans — REAL paying customers only ──
             # Join billing→accounts (handles the legacy 'account_<id>' key form). Rows that don't
             # map to a real non-test account (orphan/seed rows, anonymous trials) are dropped.
-            _acct_join = "JOIN accounts a ON (c.user_id = a.id OR c.user_id = 'account_' || a.id)"
+            # Three-way join covers: direct UUID match, 'account_<uuid>' prefix form,
+            # and rows where account_id is set but user_id is the device-composite form.
+            _acct_join = "JOIN accounts a ON (c.user_id = a.id OR c.user_id = 'account_' || a.id OR c.account_id = a.id)"
             raw_total = conn.execute(text("SELECT COUNT(*) FROM accounts")).scalar() or 0
             out["members"]["total_accounts"] = out["signups"]["total"]
             out["members"]["excluded_test"]  = raw_total - out["signups"]["total"]
@@ -4485,13 +4585,23 @@ def _admin_stripe_metrics() -> dict:
     # invoices first — they carry customer_email and are the authoritative record for
     # recurring billing. One-time charges (e.g. founding_50) are picked up via
     # stripe.Charge.list() filtered to entries with no invoice link.
+    #
+    # Dedup strategy: track invoice IDs, charge IDs, and payment_intent IDs in seen_ids.
+    # Subscription charges have charge.invoice set, but stripe-python v8+ may return it
+    # inconsistently; the payment_intent ID acts as a reliable cross-loop fallback.
     try:
         gross = 0.0
         recent: list = []
-        seen_ids: set = set()
+        seen_ids: set = set()  # invoice IDs + charge IDs + payment_intent IDs
 
         # Paid invoices — covers all subscription payments including the first month
         for inv in stripe.Invoice.list(created={"gte": since}, limit=100).auto_paging_iter():
+            inv_id = getattr(inv, "id", "") or ""
+            if inv_id in seen_ids:
+                continue  # guard against iterator duplicates
+            if inv_id:
+                seen_ids.add(inv_id)
+
             status      = getattr(inv, "status", None)
             amount_paid = getattr(inv, "amount_paid", 0) or 0
             if status == "paid" and amount_paid > 0:
@@ -4499,6 +4609,9 @@ def _admin_stripe_metrics() -> dict:
                 charge_id = getattr(inv, "charge", "") or ""
                 if charge_id:
                     seen_ids.add(charge_id)
+                pi_id = getattr(inv, "payment_intent", "") or ""
+                if pi_id:
+                    seen_ids.add(pi_id)
                 gross += amt
                 if len(recent) < 12:
                     recent.append({
@@ -4512,13 +4625,19 @@ def _admin_stripe_metrics() -> dict:
         for c in stripe.Charge.list(created={"gte": since}, limit=100).auto_paging_iter():
             paid    = getattr(c, "paid", False)
             status  = getattr(c, "status", None)
-            invoice = getattr(c, "invoice", None)
-            if paid and status == "succeeded" and not invoice:
-                cid = getattr(c, "id", "") or ""
-                if cid in seen_ids:
+            inv_ref = getattr(c, "invoice", None)
+            if inv_ref:
+                continue  # subscription charge already counted via Invoice loop above
+            if paid and status == "succeeded":
+                cid   = getattr(c, "id", "") or ""
+                pi_id = getattr(c, "payment_intent", "") or ""
+                # Secondary dedup: charge ID or payment_intent already counted via an invoice
+                if cid in seen_ids or (pi_id and pi_id in seen_ids):
                     continue
                 if cid:
                     seen_ids.add(cid)
+                if pi_id:
+                    seen_ids.add(pi_id)
                 amt             = (getattr(c, "amount", 0) or 0) / 100.0
                 billing_details = getattr(c, "billing_details", None)
                 email           = getattr(billing_details, "email", None) if billing_details else None
