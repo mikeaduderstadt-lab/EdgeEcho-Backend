@@ -4581,74 +4581,45 @@ def _admin_stripe_metrics() -> dict:
         logger.error(f"admin stripe MRR error: {e}")
 
     # Gross revenue (30d) + recent feed.
-    # Subscription payments flow through Invoices (not Charges directly), so we query
-    # invoices first — they carry customer_email and are the authoritative record for
-    # recurring billing. One-time charges (e.g. founding_50) are picked up via
-    # stripe.Charge.list() filtered to entries with no invoice link.
-    #
-    # Dedup strategy: track invoice IDs, charge IDs, and payment_intent IDs in seen_ids.
-    # Subscription charges have charge.invoice set, but stripe-python v8+ may return it
-    # inconsistently; the payment_intent ID acts as a reliable cross-loop fallback.
+    # CHARGES are the single source of truth: every successful payment — subscription
+    # renewal OR one-time — produces exactly ONE Charge. An invoice is merely the billing
+    # document for that same charge, so summing both double-counts. We verified against the
+    # live API (account API version 2026-05-27.dahlia) that Invoice.charge /
+    # Invoice.payment_intent are NOT populated and Charge.invoice is NOT populated, so
+    # cross-object dedup is impossible — charges-only is the only robust approach.
+    # Charges always carry billing_details.email. Dedup by charge id guards against
+    # iterator quirks. Gross is the full amount (refunds shown separately).
     try:
         gross = 0.0
         recent: list = []
-        seen_ids: set = set()  # invoice IDs + charge IDs + payment_intent IDs
+        seen_ids: set = set()
 
-        # Paid invoices — covers all subscription payments including the first month
-        for inv in stripe.Invoice.list(created={"gte": since}, limit=100).auto_paging_iter():
-            inv_id = getattr(inv, "id", "") or ""
-            if inv_id in seen_ids:
-                continue  # guard against iterator duplicates
-            if inv_id:
-                seen_ids.add(inv_id)
-
-            status      = getattr(inv, "status", None)
-            amount_paid = getattr(inv, "amount_paid", 0) or 0
-            if status == "paid" and amount_paid > 0:
-                amt       = amount_paid / 100.0
-                charge_id = getattr(inv, "charge", "") or ""
-                if charge_id:
-                    seen_ids.add(charge_id)
-                pi_id = getattr(inv, "payment_intent", "") or ""
-                if pi_id:
-                    seen_ids.add(pi_id)
-                gross += amt
-                if len(recent) < 12:
-                    recent.append({
-                        "type":    "charge",
-                        "amount":  round(amt, 2),
-                        "email":   getattr(inv, "customer_email", None),
-                        "created": getattr(inv, "created", None),
-                    })
-
-        # One-time charges not linked to an invoice (e.g. founding_50)
         for c in stripe.Charge.list(created={"gte": since}, limit=100).auto_paging_iter():
-            paid    = getattr(c, "paid", False)
-            status  = getattr(c, "status", None)
-            inv_ref = getattr(c, "invoice", None)
-            if inv_ref:
-                continue  # subscription charge already counted via Invoice loop above
-            if paid and status == "succeeded":
-                cid   = getattr(c, "id", "") or ""
-                pi_id = getattr(c, "payment_intent", "") or ""
-                # Secondary dedup: charge ID or payment_intent already counted via an invoice
-                if cid in seen_ids or (pi_id and pi_id in seen_ids):
-                    continue
-                if cid:
-                    seen_ids.add(cid)
-                if pi_id:
-                    seen_ids.add(pi_id)
-                amt             = (getattr(c, "amount", 0) or 0) / 100.0
-                billing_details = getattr(c, "billing_details", None)
-                email           = getattr(billing_details, "email", None) if billing_details else None
-                gross += amt
-                if len(recent) < 12:
-                    recent.append({
-                        "type":    "charge",
-                        "amount":  round(amt, 2),
-                        "email":   email,
-                        "created": getattr(c, "created", None),
-                    })
+            cid = getattr(c, "id", "") or ""
+            if cid and cid in seen_ids:
+                continue
+            if cid:
+                seen_ids.add(cid)
+
+            paid   = getattr(c, "paid", False)
+            status = getattr(c, "status", None)
+            if not (paid and status == "succeeded"):
+                continue
+
+            amt             = (getattr(c, "amount", 0) or 0) / 100.0
+            if amt <= 0:
+                continue
+            billing_details = getattr(c, "billing_details", None)
+            email           = getattr(billing_details, "email", None) if billing_details else None
+            if not email:
+                email = getattr(c, "receipt_email", None)
+            gross += amt
+            recent.append({
+                "type":    "charge",
+                "amount":  round(amt, 2),
+                "email":   email,
+                "created": getattr(c, "created", None),
+            })
 
         recent.sort(key=lambda x: x.get("created") or 0, reverse=True)
         out["gross_30d"] = round(gross, 2)
