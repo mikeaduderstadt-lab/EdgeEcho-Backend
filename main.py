@@ -752,9 +752,29 @@ Respond in the voice of a classic cartoon pirate — bold, theatrical, colorful 
 STYLE_CONFIG = {
     # No MINIMUMS on any length (owner 2026-06-16): a great short answer beats padded junk. These are
     # soft CAPS + a quality-first directive, never a floor. Kept lean to minimise prompt size (latency).
-    "Quick":     {"instruction": "LENGTH = QUICK: answer in as few words as possible while still being genuinely useful — a short phrase or one sentence. Hard cap ~25 words. Never pad to fill space.", "max_tokens": 70},
-    "Standard":  {"instruction": "LENGTH = STANDARD: a focused reply, at most ~3 sentences (~55 words). Be as brief as the answer allows — if one sentence nails it, stop there. Never pad.", "max_tokens": 160},
-    "Full":      {"instruction": "LENGTH = FULL: you MAY develop a thorough answer (up to ~220 words) with specifics and reasoning WHEN depth genuinely helps the user. But if a shorter answer is better, give the shorter one — never add filler to hit a length.", "max_tokens": 550},
+    "Quick":     {"instruction": (
+        "LENGTH = QUICK: the fewest words that fully answer the question. Strip filler and explanatory words — "
+        "keep only the key points, listed in the order the user should say them. Short connectors that carry "
+        "real meaning (\"or\", \"vs\", \"then\", \"not\") are fine; conversational filler is not. "
+        "Read like terse notes, not prose. No complete sentences. Hard cap ~25 words.\n"
+        "Example — Q: \"Tell me about yourself\"  →  A:\n"
+        "Senior engineer, 8 yrs\n"
+        "ML platform lead\n"
+        "Shipped 3 products\n"
+        "Example — Q: \"How should I respond to their pricing pushback?\"  →  A:\n"
+        "Acknowledge budget\n"
+        "ROI vs sticker price\n"
+        "Offer phased rollout"
+    ), "max_tokens": 70},
+    "Standard":  {"instruction": (
+        "LENGTH = STANDARD: a compact summary in natural language — the answer in 2-3 clear sentences or a few "
+        "short bullets (~55 words). Write it the way a person would actually say it; normal connecting words are "
+        "fine. Clear and usable, not padded. If one sentence nails it, stop there.\n"
+        "Example — Q: \"How should I respond to their pricing pushback?\"  →  A: "
+        "Acknowledge the budget concern, then reframe the conversation around ROI rather than the sticker price. "
+        "Offer a phased rollout so they can start small and scale up once they see real results."
+    ), "max_tokens": 160},
+    "Full":      {"instruction": "LENGTH = FULL: give whatever depth the answer genuinely needs — develop a thorough, naturally-written response (up to ~220 words) in full sentences with specifics, reasoning, and examples wherever they help. Normal connecting and explanatory language is expected; this is conversational prose, not notes. If a shorter answer is genuinely better, give the shorter one, but don't strip detail that helps the user.", "max_tokens": 550},
     "Nudge":     {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters. Fast and surgical.", "max_tokens": 80},
     "Brief":     {"instruction": "Respond in one short paragraph. Under 800 characters. Balanced and tactical.", "max_tokens": 220},
     "shorthand": {"instruction": "Respond in one line or two short bullets maximum. Under 300 characters.", "max_tokens": 80},
