@@ -634,6 +634,7 @@ customer_plan: dict = {}
 # ========================
 MAGIC_LINK_EXPIRY_MINUTES = int(os.environ.get("MAGIC_LINK_EXPIRY_MINUTES", "30"))
 OTP_EXPIRY_MINUTES        = int(os.environ.get("OTP_EXPIRY_MINUTES",        "10"))
+OTP_MAX_ATTEMPTS          = int(os.environ.get("OTP_MAX_ATTEMPTS",          "5"))
 SESSION_EXPIRY_DAYS       = int(os.environ.get("SESSION_EXPIRY_DAYS",       "30"))
 APP_BASE_URL              = os.environ.get("APP_BASE_URL", "https://cerebroecho.com/app")
 
@@ -1028,6 +1029,9 @@ def init_db():
         """,
         "CREATE INDEX IF NOT EXISTS email_otps_acct_idx ON email_otps(account_id)",
         "CREATE INDEX IF NOT EXISTS email_otps_code_idx ON email_otps(code)",
+        # Per-account brute-force cap for OTP codes (M8): count wrong guesses so a
+        # distributed attack across many IPs can't grind the 6-digit space.
+        "ALTER TABLE email_otps ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0",
         # ── Per-user API cost tracking ────────────────────────────────────────
         """
         CREATE TABLE IF NOT EXISTS api_usage (
@@ -3405,13 +3409,15 @@ async def export_data(request: Request, deviceId: str, userEmail: str = "anonymo
     if not wanted:
         wanted = set(ALL_SECTIONS)
 
-    # Unauthenticated requests still require a registered email to identify records
+    # PII export requires a verified session (M7). The composite deviceId+email key
+    # is client-supplied and not a secret, so allowing anonymous export would let
+    # anyone with a victim's deviceId + email dump their personal data. Requiring a
+    # valid Bearer session proves the caller owns the email before we release PII.
     if not account_id:
-        if not userEmail or userEmail.strip().lower() in ("anonymous", "") or "@" not in userEmail:
-            raise HTTPException(
-                status_code=400,
-                detail="A registered email address is required to export data. Sign in or save your email in the app first.",
-            )
+        raise HTTPException(
+            status_code=401,
+            detail="Please sign in to export your data — signing in verifies you own this email before we release personal information.",
+        )
 
     if engine is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -4365,23 +4371,42 @@ def _create_otp(account_id: str) -> str:
 
 
 def _verify_otp_code(code: str, account_id: str):
-    """Consume an OTP. Returns account_id if valid, None otherwise."""
+    """Consume an OTP. Returns account_id if valid, None otherwise.
+
+    Per-account brute-force cap (M8): we look up the account's single active OTP
+    (``_create_otp`` deletes older unused codes, so there is at most one) rather
+    than matching on the submitted code, so a WRONG guess can be counted against
+    the account. After ``OTP_MAX_ATTEMPTS`` wrong guesses the code is burned, so a
+    distributed guessing attack across many IPs can't grind the 6-digit space
+    (the per-IP ``RATE_AUTH_VERIFY`` limit alone doesn't bound per-account tries).
+    Constant-time compare avoids leaking the code via timing.
+    """
     now = datetime.utcnow().isoformat()
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT id, expires_at, used_at
-                FROM email_otps WHERE code = :code AND account_id = :aid
+                SELECT id, code, expires_at, used_at, failed_attempts
+                FROM email_otps WHERE account_id = :aid AND used_at IS NULL
                 ORDER BY expires_at DESC LIMIT 1
-            """), {"code": code, "aid": account_id}).fetchone()
+            """), {"aid": account_id}).fetchone()
             if not row:
                 return None
-            otp_id, expires_at, used_at = row[0], row[1], row[2]
-            if used_at or expires_at < now:
+            otp_id, real_code, expires_at, _used, failed = row[0], row[1], row[2], row[3], (row[4] or 0)
+            if expires_at < now:
                 return None
-            conn.execute(text("""
-                UPDATE email_otps SET used_at = :now WHERE id = :id
-            """), {"now": now, "id": otp_id})
+            if failed >= OTP_MAX_ATTEMPTS:
+                # Too many wrong guesses — burn the code so it can't be ground down.
+                conn.execute(text("UPDATE email_otps SET used_at = :now WHERE id = :id"),
+                             {"now": now, "id": otp_id})
+                conn.commit()
+                return None
+            if not _secrets.compare_digest(str(code), str(real_code)):
+                conn.execute(text("UPDATE email_otps SET failed_attempts = failed_attempts + 1 WHERE id = :id"),
+                             {"id": otp_id})
+                conn.commit()
+                return None
+            conn.execute(text("UPDATE email_otps SET used_at = :now WHERE id = :id"),
+                         {"now": now, "id": otp_id})
             conn.commit()
         return account_id
     except Exception as e:
@@ -5266,6 +5291,21 @@ async def auth_verify_email_change(request: Request, data: dict):
                 {"id": account_id}
             ).fetchone()
         old_email = acc_row[0] if acc_row else ""
+
+        # TOCTOU (L5): the new address was free when the change was REQUESTED, but
+        # another account may have claimed it since. Re-check at verify time and
+        # return a clean 409 instead of letting the UPDATE trip the UNIQUE
+        # constraint and surface as a generic 500.
+        with engine.connect() as conn:
+            taken = conn.execute(
+                text("SELECT id FROM accounts WHERE email = :email"),
+                {"email": new_email}
+            ).fetchone()
+        if taken and taken[0] != account_id:
+            raise HTTPException(status_code=409, detail={
+                "code": "EMAIL_TAKEN",
+                "message": "That email is now in use by another account. Request the change again with a different address.",
+            })
 
         with engine.connect() as conn:
             conn.execute(
