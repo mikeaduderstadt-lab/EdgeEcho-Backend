@@ -7,6 +7,7 @@ import time
 import logging
 import hashlib
 import urllib.parse
+import ipaddress
 from datetime import datetime, timedelta
 import stripe
 from sqlalchemy import create_engine, text
@@ -317,11 +318,19 @@ def _deduct_credits(user_id: str, cost: int, feature: str = None, idempotency_ke
 
         if cost > 0 and current_balance < cost:
             if not payg_enabled:
-                return -1
-            # PAYG: allow negative balance at 1.5x cost (30x markup vs 20x)
-            actual_cost = round(cost * 1.5)
-            new_balance = current_balance - actual_cost
-            op_type = "payg_usage"
+                # Not enough for the full metered cost and PAYG is off. Charge the
+                # remaining balance down to 0 and record it — do NOT return -1 leaving
+                # a sub-cost residual, which would never be billed and never trip the
+                # up-front `balance < 1` gate (the C1 revenue leak). Returns 0 so the
+                # next request's gate blocks.
+                actual_cost = current_balance
+                new_balance = 0
+                op_type = "usage"
+            else:
+                # PAYG: allow negative balance at 1.5x cost (30x markup vs 20x)
+                actual_cost = round(cost * 1.5)
+                new_balance = current_balance - actual_cost
+                op_type = "payg_usage"
         else:
             actual_cost = cost
             new_balance = max(0, current_balance - cost)
@@ -1230,7 +1239,7 @@ async def health():
     can poll freely. Returns 200 when all critical dependencies are healthy,
     503 when any critical dependency is degraded.
 
-    Critical (affect HTTP status): db, groq, deepgram
+    Critical (affect HTTP status): db, groq
     Non-critical (informational only): cartesia, stripe, resend
     Note: `tts` reflects the REAL outcome of recent /tts calls (degrades on a
     Cartesia upstream failure within the last 10 min); `cartesia` is key-presence only.
@@ -1277,7 +1286,11 @@ async def health():
             "seconds_ago":     round(time.time() - tts_failure["at"]),
         }
 
-    healthy = db_ok and groq_ok and deepgram_ok
+    # Deepgram is NOT gated as critical: the live product transcribes via Groq Whisper
+    # (/coach, /quick_transcribe). /transcribe (the only Deepgram path) is unused by the
+    # frontend, so a lapsed Deepgram key must not 503 the whole backend. Kept in `checks`
+    # for visibility only.
+    healthy = db_ok and groq_ok
     uptime_s = round(time.time() - _START_TIME)
     return JSONResponse(
         status_code=200 if healthy else 503,
@@ -1981,8 +1994,8 @@ async def text_to_speech(request: Request, data: dict):
     if plan_info["plan_type"] not in TTS_ALLOWED_PLANS:
         raise HTTPException(status_code=403, detail={
             "code": "PLAN_REQUIRED",
-            "message": "TTS audio requires Pro plan or above.",
-            "required_plan": "pro",
+            "message": "TTS audio requires the Solo plan or above.",
+            "required_plan": "echo",
         })
 
     cartesia_api_key = os.environ.get("CARTESIA_API_KEY")
@@ -2327,6 +2340,29 @@ async def upload_context(
 # PERPLEXITY_API_KEY reserved for future use.
 # ========================
 
+def _is_public_http_url(url: str) -> bool:
+    """True if url is a public http(s) address. Matches on the parsed HOST — not a
+    substring of the whole URL, which false-flagged legit public links containing
+    '10.'/'192.168.' etc. (e.g. '.../ios-10.0-review'). Blocks localhost + literal
+    private/loopback/link-local IPs. Exotic IP encodings aren't exhaustively covered;
+    the /brief + /prep fetches go through r.jina.ai, which is the real SSRF mitigation."""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local
+                           or ip.is_reserved or ip.is_unspecified):
+        return False
+    return True
+
+
 @app.post("/brief")
 @limiter.limit(RATE_BRIEF)
 async def brief_url(request: Request, data: dict):
@@ -2345,7 +2381,7 @@ async def brief_url(request: Request, data: dict):
         raise HTTPException(status_code=400, detail="No URL provided")
     if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
-    if any(blocked in url.lower() for blocked in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.", "10.", "192.168.", "172.16.")):
+    if not _is_public_http_url(url):
         raise HTTPException(status_code=400, detail="That URL is not publicly accessible.")
 
     # Plan gate: Command+ only — use _resolve_user for cross-device consistency
@@ -3795,6 +3831,11 @@ async def stripe_webhook(request: Request):
 
         logger.info(f"📨 Stripe webhook: {event_type} | id={event_id}")
 
+        # Tracks whether any handler's DB provisioning failed. If so we must NOT mark
+        # the event processed and must return 5xx so Stripe retries (prevents "paid but
+        # 0 credits"). DB writes below are ON CONFLICT upserts, so reprocessing is safe.
+        handler_failed = False
+
         # ── checkout.session.completed ────────────────────────────────────────
         if event_type == "checkout.session.completed":
             meta        = obj.get("metadata", {})
@@ -3859,11 +3900,18 @@ async def stripe_webhook(request: Request):
 
                         conn.commit()
                     logger.info(f"✅ checkout.session.completed: user={user_id} account={account_id} plan={plan} balance={new_balance}")
-                    to_email = user_id.split("_", 1)[1] if "_" in user_id else ""
-                    email_service.send_upgrade_email(to_email, plan, new_balance)
-                    _track_usage(user_id, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "upgrade", "plan": plan}))
+                    # Post-commit side effects are best-effort: a failure here must NOT
+                    # force a Stripe retry (credits are already provisioned), else the
+                    # retry would re-send the upgrade email.
+                    try:
+                        to_email = user_id.split("_", 1)[1] if "_" in user_id else ""
+                        email_service.send_upgrade_email(to_email, plan, new_balance)
+                        _track_usage(user_id, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "upgrade", "plan": plan}))
+                    except Exception as _e:
+                        logger.error(f"checkout.session.completed post-commit side-effect error: {_e}")
                 except Exception as e:
                     logger.error(f"❌ checkout.session.completed DB error: {e}")
+                    handler_failed = True
 
         # ── invoice.paid (monthly renewal) ────────────────────────────────────
         # Fires for every successful invoice. We reset credits on subscription_cycle
@@ -3914,6 +3962,7 @@ async def stripe_webhook(request: Request):
                             )
                         except Exception as e:
                             logger.error(f"❌ invoice.paid DB error: {e}")
+                            handler_failed = True
 
         # ── invoice.payment_failed ─────────────────────────────────────────────
         elif event_type == "invoice.payment_failed":
@@ -3971,11 +4020,19 @@ async def stripe_webhook(request: Request):
                         f"attempt={attempt_count} failures_total={fail_count} "
                         f"next_retry={next_str} amount_due={amount_due}"
                     )
-                    to_email = uid.split("_", 1)[1] if "_" in uid else ""
-                    email_service.send_payment_failed_email(to_email, attempt_count, next_str, amount_due)
-                    _track_usage(uid, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "payment_failed"}))
+                    # Post-commit side effects are best-effort. The failure-count increment
+                    # above is NON-idempotent, so if these throw and force a Stripe retry the
+                    # whole handler re-runs and double-counts the failure (could prematurely
+                    # downgrade a customer who only failed once). Swallow so no retry fires.
+                    try:
+                        to_email = uid.split("_", 1)[1] if "_" in uid else ""
+                        email_service.send_payment_failed_email(to_email, attempt_count, next_str, amount_due)
+                        _track_usage(uid, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "payment_failed"}))
+                    except Exception as _e:
+                        logger.error(f"invoice.payment_failed post-commit side-effect error: {_e}")
                 except Exception as e:
                     logger.error(f"❌ invoice.payment_failed DB error: {e}")
+                    handler_failed = True
 
         # ── customer.subscription.updated ─────────────────────────────────────
         # Fires on: plan change via portal, cancel-at-period-end toggle,
@@ -4033,6 +4090,7 @@ async def stripe_webhook(request: Request):
                             conn.commit()
                     except Exception as e:
                         logger.error(f"❌ subscription.updated (active) DB error: {e}")
+                        handler_failed = True
 
                 elif status == "past_due":
                     try:
@@ -4045,6 +4103,7 @@ async def stripe_webhook(request: Request):
                         logger.warning(f"⚠️ subscription.updated: {uid} is past_due")
                     except Exception as e:
                         logger.error(f"❌ subscription.updated (past_due) DB error: {e}")
+                        handler_failed = True
 
                 elif status in ("canceled", "incomplete_expired", "unpaid"):
                     try:
@@ -4061,6 +4120,7 @@ async def stripe_webhook(request: Request):
                         logger.info(f"🚫 subscription.updated: status={status} — downgraded {uid} to free")
                     except Exception as e:
                         logger.error(f"❌ subscription.updated (canceled/unpaid) DB error: {e}")
+                        handler_failed = True
 
                 else:
                     logger.info(f"📨 subscription.updated: unhandled status={status!r} for {uid}")
@@ -4093,11 +4153,18 @@ async def stripe_webhook(request: Request):
                         if ended_at else "unknown"
                     )
                     logger.info(f"🚫 subscription.deleted: downgraded {uid} to free | ended_at={ended_str}")
-                    to_email = uid.split("_", 1)[1] if "_" in uid else ""
-                    email_service.send_cancellation_email(to_email, ended_str)
-                    _track_usage(uid, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "cancellation"}))
+                    # Post-commit side effects are best-effort: the DB write above is an
+                    # idempotent absolute SET, but an email/track failure must NOT force a
+                    # Stripe retry (it would re-send the cancellation email). Swallow it.
+                    try:
+                        to_email = uid.split("_", 1)[1] if "_" in uid else ""
+                        email_service.send_cancellation_email(to_email, ended_str)
+                        _track_usage(uid, to_email, "resend_email", 1, 0.0001, json.dumps({"type": "cancellation"}))
+                    except Exception as _e:
+                        logger.error(f"subscription.deleted post-commit side-effect error: {_e}")
                 except Exception as e:
                     logger.error(f"❌ subscription.deleted DB error: {e}")
+                    handler_failed = True
 
         # ── charge.refunded ────────────────────────────────────────────────────
         # Handles refunds on one-time payments (founding_50 mode=payment).
@@ -4142,6 +4209,7 @@ async def stripe_webhook(request: Request):
                             )
                 except Exception as e:
                     logger.error(f"❌ charge.refunded DB error: {e}")
+                    handler_failed = True
 
         else:
             logger.info(f"📨 Unhandled Stripe event type: {event_type!r}")
@@ -4151,8 +4219,13 @@ async def stripe_webhook(request: Request):
         logger.error(f"❌ Unhandled webhook exception ({event_type} | {event_id}): {e}")
         import traceback
         logger.error(traceback.format_exc())
-        # Still mark processed to prevent infinite retries on bugs.
-        # Remove this line if you want Stripe to retry on unexpected exceptions.
+        handler_failed = True
+
+    if handler_failed:
+        # A handler's DB provisioning failed. Do NOT mark the event processed — return
+        # 5xx so Stripe retries later (prevents charged-but-no-credits). The DB writes
+        # above are ON CONFLICT-idempotent, so reprocessing on retry is safe.
+        raise HTTPException(status_code=500, detail="webhook handler error — will retry")
 
     _mark_event_processed(event_id, event_type)
     return {"received": True}
@@ -4782,20 +4855,25 @@ async def admin_metrics(request: Request):
 
 
 @app.post("/save_email")
-async def save_email(data: dict):
+@limiter.limit(RATE_AUTH_REQUEST)
+async def save_email(request: Request, data: dict):
     device_id = data.get("deviceId")
-    email = data.get("email")
+    email = (data.get("email") or "").strip().lower()
+    # Validate before firing a Resend email — this endpoint is unauthenticated, so
+    # rate-limit + input-validate it to avoid email-bombing / Resend-cost abuse.
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
     old_key = f"{device_id}_anonymous"
     new_key = f"{device_id}_{email}"
-    
+
     if old_key in usage_tracker:
         usage_tracker[new_key] = usage_tracker[old_key]
         del usage_tracker[old_key]
-    
+
     logger.info(f"📧 Email saved: {email}")
     email_service.send_welcome_email(email)
     _track_usage(email, email, "resend_email", 1, 0.0001, json.dumps({"type": "welcome"}))
-    return {"status": "success", "message": "Trial extended to 10 questions"}
+    return {"status": "success"}
 
 # ========================
 # AUTH ENDPOINTS
@@ -5231,7 +5309,7 @@ async def admin_usage_summary(request: Request):
     """Internal cost dashboard. Protected by APP_SECRET header (x-app-secret)."""
     secret   = request.headers.get("x-app-secret", "")
     expected = os.environ.get("APP_SECRET", "")
-    if not expected or secret != expected:
+    if not expected or not _secrets.compare_digest(secret, expected):
         raise HTTPException(status_code=403, detail="Forbidden")
     if engine is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -5322,7 +5400,7 @@ async def debug_prompts(request: Request):
     """Return exact system prompts for every role×mode×style combo. Protected by APP_SECRET."""
     secret   = request.headers.get("x-app-secret", "")
     expected = os.environ.get("APP_SECRET", "")
-    if not expected or secret != expected:
+    if not expected or not _secrets.compare_digest(secret, expected):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     roles  = list(ROLE_PROMPTS.keys())
@@ -5388,14 +5466,7 @@ async def prep_session(request: Request, data: dict):
         urls = []  # silently drop URLs for plans below command
 
     # Validate (reject non-http(s) + private/localhost) and cap how many links we research.
-    def _valid_brief_url(u):
-        if not (u.startswith("http://") or u.startswith("https://")):
-            return False
-        if any(b in u.lower() for b in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.", "10.", "192.168.", "172.16.")):
-            return False
-        return True
-
-    urls = [u for u in urls if _valid_brief_url(u)][:5]  # cap at 5 links per brief
+    urls = [u for u in urls if _is_public_http_url(u)][:5]  # cap at 5 links per brief
     # Split the content budget across links so many links don't blow up the prompt/cost.
     per_url_chars = 12000 if len(urls) <= 1 else max(3000, 24000 // max(1, len(urls)))
 
